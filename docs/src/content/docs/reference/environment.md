@@ -202,6 +202,19 @@ Directory holding gh's `hosts.yml`, consulted when detecting self-hosted GitHub 
 
 When the upstream hostname is not `github.com`, no-mistakes reads gh's configured hosts from `$GH_CONFIG_DIR/hosts.yml` to decide whether the host is a GitHub Enterprise instance. It takes precedence over `XDG_CONFIG_HOME`. A selected [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry overrides this variable for that run and removes `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, and `GH_REPO` from all child processes. See [Provider Integration](/no-mistakes/guides/provider-integration/#self-hosted-githubgitlab).
 
+## `CLAUDE_CONFIG_DIR`
+
+Claude Code's personal configuration directory, which decides where `init` installs the `/no-mistakes` agent skill for Claude Code.
+
+|         |            |
+| ------- | ---------- |
+| Type    | `string`   |
+| Default | `~/.claude` |
+
+Claude Code reads this variable to relocate its whole personal configuration directory, which is how per-profile setups keep separate accounts (for example `~/.claude-work`). `no-mistakes init` follows it and writes the skill to `$CLAUDE_CONFIG_DIR/skills/no-mistakes/SKILL.md`, so the skill lands in the profile the Claude Code session actually reads. A relative value is resolved against the working directory.
+
+The vendor-neutral `~/.agents/skills/no-mistakes/SKILL.md` copy - the one Codex, OpenCode, Rovo Dev, and Pi read - is not a Claude Code directory and is unaffected. See [`init`](/no-mistakes/reference/cli/#init).
+
 ## `XDG_CONFIG_HOME`
 
 Config directory used to locate glab's `config.yml` for self-hosted GitLab detection, gh's `hosts.yml` for self-hosted GitHub Enterprise detection, and tea's `config.yml` for Gitea detection.
