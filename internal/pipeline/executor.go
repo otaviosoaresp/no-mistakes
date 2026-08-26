@@ -684,12 +684,14 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
 	autoFixLimit := 0
+	maxRounds := 0
 	if e.config != nil {
 		autoFixLimit = e.config.AutoFixLimit(stepName)
+		maxRounds = e.config.MaxRoundsLimit(stepName)
 	}
 
 	// Mark step as running
-	if err := e.db.StartStepWithAutoFixLimit(sr.ID, autoFixLimit); err != nil {
+	if err := e.db.StartStepWithLimits(sr.ID, autoFixLimit, maxRounds); err != nil {
 		return false, "", fmt.Errorf("start step %s: %w", stepName, err)
 	}
 	e.emitStepEvent(ipc.EventStepStarted, run, repo, stepName, string(types.StepStatusRunning))
@@ -785,6 +787,21 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	autoFixAttempts := state.autoFixAttempts
 	roundNum := state.roundNum
 
+	// roundBudgetSpent reports whether this step has already run its whole
+	// round budget, counting every round the same way: the initial pass, each
+	// automatic fix round, and each round an agent asked for at a gate.
+	// auto_fix caps only the automatic ones, so without this a driver
+	// answering `--action fix` at every gate loops without bound - the review
+	// loop has no fixed point when a thorough reviewer keeps substantiating
+	// new findings on a large diff, and each round re-reads that whole diff.
+	//
+	// Exhaustion never approves the step and never rewrites a finding: the
+	// remaining findings park at the gate and only the fix action is withdrawn,
+	// so approve, skip, and abort stay with whoever is driving the run.
+	roundBudgetSpent := func() bool {
+		return maxRounds > 0 && roundNum >= maxRounds
+	}
+
 	stepAgent := e.agent
 	if stepAgent != nil {
 		// Innermost: default-by-construction invocation deadline so a step
@@ -855,6 +872,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	var restartFrom types.StepName
 
 	// Execute with possible fix loop
+rounds:
 	for {
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
@@ -939,7 +957,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// Only auto-fix findings whose action is "auto-fix".
 		// This runs before the NeedsApproval check so that all severity
 		// levels (including "info") get a chance at automatic fixing.
-		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit {
+		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit && !roundBudgetSpent() {
 			fixableFindings := autoFixableFindingsJSON(outcome.Findings)
 			if fixableFindings != "" {
 				autoFixAttempts++
@@ -976,6 +994,10 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			break
 		}
 
+		if roundBudgetSpent() {
+			writeLog(fmt.Sprintf("round budget spent (%d/%d): parking the remaining findings - respond with approve, skip, or abort (max_rounds.%s raises the budget)", roundNum, maxRounds, stepName))
+		}
+
 		// Freeze execution timer before entering approval wait.
 		executionMS += time.Since(phaseStart).Milliseconds()
 
@@ -990,115 +1012,129 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			approvalStatus = types.StepStatusFixReview
 		}
 
-		// Mark executor as ready to receive approval before updating DB or
-		// emitting events, so that callers who poll the DB status can
-		// immediately call Respond once they see it.
-		e.mu.Lock()
-		e.waiting = true
-		e.waitingStep = stepName
-		e.mu.Unlock()
-
-		// Parking starts before the gate becomes observable. This includes the
-		// small handoff from publishing the gate to receiving a response, and
-		// prevents a prompt response from being omitted from the parked total.
-		parkStart := time.Now()
-
-		// Surface the park as a pollable, run-level signal so a supervisor can
-		// tell in one `axi status` read that the run is waiting for the agent
-		// to drive this gate (versus actively running/fixing/ci). Observability
-		// only: it does not change the wait below. Cleared once the wait ends.
-		if dbErr := e.db.ParkStepForApproval(run.ID, sr.ID, approvalStatus, executionMS, findingsPtr); dbErr != nil {
+		// The gate is its own loop: a fix request refused for want of round
+		// budget re-publishes the same gate rather than re-running the step,
+		// so the driver can still approve, skip, or abort without the run
+		// spending another round to get back here.
+	gate:
+		for {
+			// Mark executor as ready to receive approval before updating DB or
+			// emitting events, so that callers who poll the DB status can
+			// immediately call Respond once they see it.
 			e.mu.Lock()
-			e.waiting = false
-			e.waitingStep = ""
+			e.waiting = true
+			e.waitingStep = stepName
 			e.mu.Unlock()
-			return false, "", fmt.Errorf("persist %s approval gate: %w", stepName, dbErr)
-		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(approvalStatus), outcome.Findings, "", &executionMS)
 
-		response, reconciled, err := e.waitForApprovalOrReconcile(ctx, step, sctx, true)
-		if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
-			slog.Warn("failed to complete awaiting-agent state in db", "step", stepName, "run", run.ID, "error", dbErr)
-		}
-		if err != nil {
-			if dbErr := e.db.FailStep(sr.ID, err.Error(), executionMS); dbErr != nil {
-				slog.Warn("failed to mark step as failed in db", "step", stepName, "error", dbErr)
+			// Parking starts before the gate becomes observable. This includes the
+			// small handoff from publishing the gate to receiving a response, and
+			// prevents a prompt response from being omitted from the parked total.
+			parkStart := time.Now()
+
+			// Surface the park as a pollable, run-level signal so a supervisor can
+			// tell in one `axi status` read that the run is waiting for the agent
+			// to drive this gate (versus actively running/fixing/ci). Observability
+			// only: it does not change the wait below. Cleared once the wait ends.
+			if dbErr := e.db.ParkStepForApproval(run.ID, sr.ID, approvalStatus, executionMS, findingsPtr); dbErr != nil {
+				e.mu.Lock()
+				e.waiting = false
+				e.waitingStep = ""
+				e.mu.Unlock()
+				return false, "", fmt.Errorf("persist %s approval gate: %w", stepName, dbErr)
 			}
-			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", err.Error(), &executionMS)
-			return false, "", fmt.Errorf("step %s: waiting for approval: %w", stepName, err)
-		}
-		if reconciled {
-			phaseStart = time.Now()
-			goto done
-		}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(approvalStatus), outcome.Findings, "", &executionMS)
 
-		approvalFields := telemetry.Fields{
-			"step":       string(stepName),
-			"action":     string(response.action),
-			"fix_review": sctx.Fixing,
-		}
-		if agentName := e.telemetryAgentName(); agentName != "" {
-			approvalFields["agent"] = agentName
-		}
-		if selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs); selectedCount > 0 {
-			approvalFields["selected_findings_count"] = selectedCount
-		}
-		telemetry.Track("approval", approvalFields)
-
-		switch response.action {
-		case types.ActionApprove:
-			// Approved - execution already frozen in executionMS, reset phaseStart
-			// so the done label computes no additional elapsed.
-			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
-			phaseStart = time.Now()
-			goto done
-
-		case types.ActionSkip:
-			// Skip - mark step skipped and return (not an error)
-			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
-			if err := e.db.CompleteStepWithStatus(sr.ID, types.StepStatusSkipped, finalExitCode, executionMS, logPath); err != nil {
-				return false, "", fmt.Errorf("complete step %s (skip): %w", stepName, err)
+			response, reconciled, err := e.waitForApprovalOrReconcile(ctx, step, sctx, true)
+			if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
+				slog.Warn("failed to complete awaiting-agent state in db", "step", stepName, "run", run.ID, "error", dbErr)
 			}
-			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusSkipped), "", "", &executionMS)
-			return false, "", nil
-
-		case types.ActionAbort:
-			e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
-			if dbErr := e.db.FailStep(sr.ID, "aborted by user", executionMS); dbErr != nil {
-				slog.Warn("failed to mark step as failed in db", "step", stepName, "error", dbErr)
+			if err != nil {
+				if dbErr := e.db.FailStep(sr.ID, err.Error(), executionMS); dbErr != nil {
+					slog.Warn("failed to mark step as failed in db", "step", stepName, "error", dbErr)
+				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", err.Error(), &executionMS)
+				return false, "", fmt.Errorf("step %s: waiting for approval: %w", stepName, err)
 			}
-			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", "aborted by user", &executionMS)
-			return false, "", fmt.Errorf("step %s: aborted by user", stepName)
-
-		case types.ActionFix:
-			telemetry.Track("fix", e.fixTelemetryFields("user", stepName, selectedFindingCount(outcome.Findings, response.findingIDs), 0))
-			// Fix - mark step as fixing, resume execution timer, re-execute.
-			phaseStart = time.Now()
-			selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs)
-			writeLog(fmt.Sprintf("user-fix round starting after round %d (%d %s selected)", roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
-			if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
-				slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
+			if reconciled {
+				phaseStart = time.Now()
+				goto done
 			}
-			sctx.Fixing = true
-			selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
-			mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
-			sctx.PreviousFindings = mergedFindings
-			nextTrigger = "auto_fix"
-			if currentRoundID != "" {
-				allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)
-				if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
-					var userFindingsJSON *string
-					if mergedFindings != "" && mergedFindings != selectedFindings {
-						userFindingsJSON = &mergedFindings
-					}
-					if dbErr := e.db.SetStepRoundUserDecision(currentRoundID, &idsJSON, db.RoundSelectionSourceUser, userFindingsJSON); dbErr != nil {
-						slog.Warn("failed to record user decision", "step", stepName, "round", roundNum, "error", dbErr)
+
+			approvalFields := telemetry.Fields{
+				"step":       string(stepName),
+				"action":     string(response.action),
+				"fix_review": sctx.Fixing,
+			}
+			if agentName := e.telemetryAgentName(); agentName != "" {
+				approvalFields["agent"] = agentName
+			}
+			if selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs); selectedCount > 0 {
+				approvalFields["selected_findings_count"] = selectedCount
+			}
+			telemetry.Track("approval", approvalFields)
+
+			switch response.action {
+			case types.ActionApprove:
+				// Approved - execution already frozen in executionMS, reset phaseStart
+				// so the done label computes no additional elapsed.
+				e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
+				phaseStart = time.Now()
+				goto done
+
+			case types.ActionSkip:
+				// Skip - mark step skipped and return (not an error)
+				e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
+				if err := e.db.CompleteStepWithStatus(sr.ID, types.StepStatusSkipped, finalExitCode, executionMS, logPath); err != nil {
+					return false, "", fmt.Errorf("complete step %s (skip): %w", stepName, err)
+				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusSkipped), "", "", &executionMS)
+				return false, "", nil
+
+			case types.ActionAbort:
+				e.recordDeclinedRound(currentRoundID, outcome.Findings, stepName, roundNum)
+				if dbErr := e.db.FailStep(sr.ID, "aborted by user", executionMS); dbErr != nil {
+					slog.Warn("failed to mark step as failed in db", "step", stepName, "error", dbErr)
+				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", "aborted by user", &executionMS)
+				return false, "", fmt.Errorf("step %s: aborted by user", stepName)
+
+			case types.ActionFix:
+				if roundBudgetSpent() {
+					// Refusing here rather than silently approving keeps the
+					// verdict with the driver: the findings stay blocking and
+					// the same gate is published again.
+					writeLog(fmt.Sprintf("fix refused: round budget spent (%d/%d). Respond with approve, skip, or abort, or raise max_rounds.%s", roundNum, maxRounds, stepName))
+					continue gate
+				}
+				telemetry.Track("fix", e.fixTelemetryFields("user", stepName, selectedFindingCount(outcome.Findings, response.findingIDs), 0))
+				// Fix - mark step as fixing, resume execution timer, re-execute.
+				phaseStart = time.Now()
+				selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs)
+				writeLog(fmt.Sprintf("user-fix round starting after round %d (%d %s selected)", roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
+				if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
+					slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
+				}
+				sctx.Fixing = true
+				selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
+				mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
+				sctx.PreviousFindings = mergedFindings
+				nextTrigger = "auto_fix"
+				if currentRoundID != "" {
+					allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)
+					if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
+						var userFindingsJSON *string
+						if mergedFindings != "" && mergedFindings != selectedFindings {
+							userFindingsJSON = &mergedFindings
+						}
+						if dbErr := e.db.SetStepRoundUserDecision(currentRoundID, &idsJSON, db.RoundSelectionSourceUser, userFindingsJSON); dbErr != nil {
+							slog.Warn("failed to record user decision", "step", stepName, "round", roundNum, "error", dbErr)
+						}
 					}
 				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFixing), "", "", nil)
+				slog.Info("step fix requested, re-executing", "step", stepName)
+				continue rounds
 			}
-			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFixing), "", "", nil)
-			slog.Info("step fix requested, re-executing", "step", stepName)
-			continue // loop back to step.Execute
 		}
 	}
 

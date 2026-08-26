@@ -13,7 +13,7 @@ The daemon also reads `document.instructions`, `review.path_instructions`, `disa
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
 Commit the gate-control settings you want to your default branch.
-Non-executing fields (`ignore_patterns`, `auto_fix`, `commit`, `intent`, `test`) are still read from the pushed branch, except `test.evidence.branch`, which names a git ref the daemon pushes to.
+Non-executing fields (`ignore_patterns`, `auto_fix`, `max_rounds`, `commit`, `intent`, `test`) are still read from the pushed branch, except `test.evidence.branch`, which names a git ref the daemon pushes to.
 
 If you genuinely want per-branch `commands` and `agent` (for example, a single-developer repo where you trust your own feature branches), opt in with [`allow_repo_commands: true`](#allow_repo_commands) in this same file on your default branch. This re-enables the previous behavior with eyes open. The switch is read only from the trusted default-branch copy, so a contributor cannot self-enable it from a pushed branch.
 :::
@@ -69,6 +69,9 @@ auto_fix:
   document: 3
   lint: 5
   ci: 3
+
+max_rounds:
+  review: 4
 
 # Read only from the trusted default branch: each rerun is another workflow run.
 ci:
@@ -360,6 +363,25 @@ For empty `commands.lint`, the document step's combined housekeeping pass also a
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.
 
 Legacy alias: `auto_fix.babysit`.
+
+### max_rounds
+
+Override the total round budget for specific steps. Fields not set here inherit from global config, whose [`max_rounds`](/reference/global-config/#max_rounds) entry owns what a round is and what happens when the budget is spent.
+
+| | |
+|---|---|
+| Type | `object` |
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `max_rounds.review` | `int` | Inherits from global (default `0`, unlimited) |
+| `max_rounds.test` | `int` | Inherits from global (default `0`, unlimited) |
+| `max_rounds.lint` | `int` | Inherits from global (default `0`, unlimited) |
+| `max_rounds.document` | `int` | Inherits from global (default `0`, unlimited) |
+| `max_rounds.ci` | `int` | Inherits from global (default `0`, unlimited) |
+| `max_rounds.rebase` | `int` | Inherits from global (default `0`, unlimited) |
+
+A spent budget parks the step's remaining findings at its gate; it never approves the step and never downgrades a finding, so lowering the budget from a pushed branch cannot weaken the gate.
 
 ### ci.rerun_transient
 

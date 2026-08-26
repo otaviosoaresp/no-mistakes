@@ -506,6 +506,12 @@ func gateResolution(gate stepView, alreadyFixed bool) (types.ApprovalAction, []s
 	if alreadyFixed || gate.Status == string(types.StepStatusFixReview) {
 		return types.ActionApprove, nil
 	}
+	// A spent round budget makes fix unavailable, so --yes takes the decision
+	// it already takes once a step has been fixed: approve and converge,
+	// rather than send a fix the executor will refuse and re-park.
+	if gateRoundBudgetSpent(gate) {
+		return types.ActionApprove, nil
+	}
 	parsed, err := types.ParseFindingsJSON(gate.FindingsJSON)
 	if err != nil || !types.HasActionableFindings(parsed) {
 		return types.ActionApprove, nil

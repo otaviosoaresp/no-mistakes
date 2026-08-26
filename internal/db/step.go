@@ -25,17 +25,29 @@ type StepResult struct {
 	LastActivity   *string
 	AgentPID       *int
 	AutoFixLimit   *int
+	MaxRounds      *int
 	CIFixAttempts  int
 }
 
 const stepResultColumns = `id, run_id, step_name, step_order, status, exit_code, duration_ms, log_path, findings_json, error, started_at, completed_at, last_activity_at, last_activity, agent_pid, auto_fix_limit`
 
+// readableStepResultColumns selects every column added after the original
+// schema only when it is actually present. Read-only preflight can inspect a
+// database before migrations run, and naming a missing column there fails the
+// query outright, which would block every pipeline-control command.
 func (d *DB) readableStepResultColumns() string {
-	if d.hasColumn("step_results", "ci_fix_attempts") {
-		return stepResultColumns + ", ci_fix_attempts"
+	cols := stepResultColumns
+	if d.hasColumn("step_results", "max_rounds") {
+		cols += ", max_rounds"
+	} else {
+		cols += ", NULL AS max_rounds"
 	}
-	// Read-only preflight can inspect a database before migrations run.
-	return stepResultColumns + ", 0 AS ci_fix_attempts"
+	if d.hasColumn("step_results", "ci_fix_attempts") {
+		cols += ", ci_fix_attempts"
+	} else {
+		cols += ", 0 AS ci_fix_attempts"
+	}
+	return cols
 }
 
 // InsertStepResult creates a new step result record.
@@ -62,7 +74,7 @@ func (d *DB) GetStepResult(id string) (*StepResult, error) {
 	s := &StepResult{}
 	err := d.sql.QueryRow(
 		`SELECT `+d.readableStepResultColumns()+` FROM step_results WHERE id = ?`, id,
-	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.CIFixAttempts)
+	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -84,7 +96,7 @@ func (d *DB) GetStepsByRun(runID string) ([]*StepResult, error) {
 	var steps []*StepResult
 	for rows.Next() {
 		s := &StepResult{}
-		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.CIFixAttempts); err != nil {
+		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts); err != nil {
 			return nil, fmt.Errorf("scan step result: %w", err)
 		}
 		steps = append(steps, s)
@@ -98,7 +110,7 @@ func (d *DB) ResetStepsFrom(runID string, stepOrder int) error {
 		SET status = ?, exit_code = NULL, duration_ms = NULL, log_path = NULL,
 			findings_json = NULL, error = NULL, started_at = NULL,
 			completed_at = NULL, last_activity_at = NULL, last_activity = NULL,
-			agent_pid = NULL, auto_fix_limit = NULL
+			agent_pid = NULL, auto_fix_limit = NULL, max_rounds = NULL
 		WHERE run_id = ? AND step_order >= ? AND status != ?`, types.StepStatusPending, runID, stepOrder, types.StepStatusSkipped)
 	if err != nil {
 		return fmt.Errorf("reset steps for revalidation: %w", err)
@@ -168,14 +180,15 @@ func (d *DB) ParkStepForApproval(runID, stepID string, status types.StepStatus, 
 
 // StartStep marks a step as running with a started_at timestamp.
 func (d *DB) StartStep(id string) error {
-	return d.StartStepWithAutoFixLimit(id, 0)
+	return d.StartStepWithLimits(id, 0, 0)
 }
 
-// StartStepWithAutoFixLimit marks a step as running and records the effective
-// auto-fix limit that status surfaces use while the step is active.
-func (d *DB) StartStepWithAutoFixLimit(id string, autoFixLimit int) error {
+// StartStepWithLimits marks a step as running and records the effective
+// auto-fix limit and total round budget that status surfaces use while the
+// step is active. Either limit is stored as NULL when it is unlimited.
+func (d *DB) StartStepWithLimits(id string, autoFixLimit, maxRounds int) error {
 	ts := now()
-	_, err := d.sql.Exec(`UPDATE step_results SET status = ?, started_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, auto_fix_limit = ? WHERE id = ?`, types.StepStatusRunning, ts, ts, "step started", autoFixLimitDBValue(autoFixLimit), id)
+	_, err := d.sql.Exec(`UPDATE step_results SET status = ?, started_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, auto_fix_limit = ?, max_rounds = ? WHERE id = ?`, types.StepStatusRunning, ts, ts, "step started", stepLimitDBValue(autoFixLimit), stepLimitDBValue(maxRounds), id)
 	if err != nil {
 		return fmt.Errorf("start step: %w", err)
 	}
@@ -183,7 +196,7 @@ func (d *DB) StartStepWithAutoFixLimit(id string, autoFixLimit int) error {
 }
 
 func (d *DB) SetStepAutoFixLimit(id string, autoFixLimit int) error {
-	if _, err := d.sql.Exec(`UPDATE step_results SET auto_fix_limit = ? WHERE id = ?`, autoFixLimitDBValue(autoFixLimit), id); err != nil {
+	if _, err := d.sql.Exec(`UPDATE step_results SET auto_fix_limit = ? WHERE id = ?`, stepLimitDBValue(autoFixLimit), id); err != nil {
 		return fmt.Errorf("set step auto-fix limit: %w", err)
 	}
 	return nil
@@ -196,11 +209,13 @@ func (d *DB) SetCIFixAttempts(id string, attempts int) error {
 	return nil
 }
 
-func autoFixLimitDBValue(autoFixLimit int) any {
-	if autoFixLimit <= 0 {
+// stepLimitDBValue stores a non-positive limit as NULL, so "unlimited" reads
+// back the same way for rows written before the column existed.
+func stepLimitDBValue(limit int) any {
+	if limit <= 0 {
 		return nil
 	}
-	return autoFixLimit
+	return limit
 }
 
 // CompleteStep marks a step as completed with timing and result info.

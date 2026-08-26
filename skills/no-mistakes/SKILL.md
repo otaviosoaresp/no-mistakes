@@ -181,6 +181,14 @@ Run the pipeline and decide on its findings as they come up:
    self-fixed. (Other steps such as test and lint may auto-fix within the
    pipeline and re-run before they ever gate.)
 
+   **A `round_budget: spent` field means `--action fix` is no longer
+   available for that step**: the run has used the whole round budget its
+   config allows (`max_rounds.<step>`), so the pipeline refuses further fix
+   rounds and re-publishes the same gate. The findings still block and none of
+   them were downgraded - the decision is yours. Respond with
+   `approve`, `skip`, or `abort`, or escalate to the user, and
+   raise `max_rounds.<step>` in config only if they ask for more rounds.
+
    Choose one response:
    ```sh
    # accept the step as-is and continue
