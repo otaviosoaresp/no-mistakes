@@ -142,6 +142,7 @@ type GlobalConfig struct {
 	SessionReuse  bool          `yaml:"-"`
 	ForgeProfiles ForgeProfiles `yaml:"forge_profiles"`
 	AutoFix       AutoFixRaw
+	MaxRounds     MaxRoundsRaw
 	// CI is the operator's own CI-step floor. It is the only place the rerun
 	// budget can be set for a repository whose default branch this machine's
 	// user does not control (the common case when contributing to someone
@@ -178,6 +179,7 @@ type globalConfigRaw struct {
 	LogLevel                string                     `yaml:"log_level"`
 	SessionReuse            *bool                      `yaml:"session_reuse"`
 	AutoFix                 AutoFixRaw                 `yaml:"auto_fix"`
+	MaxRounds               MaxRoundsRaw               `yaml:"max_rounds"`
 	CI                      CIRaw                      `yaml:"ci"`
 	Commit                  CommitRaw                  `yaml:"commit"`
 	Intent                  IntentRaw                  `yaml:"intent"`
@@ -215,12 +217,13 @@ type RepoConfig struct {
 	// PR carries pull-request routing settings. BaseBranch controls where a PR
 	// lands, so EffectiveRepoConfig treats it as trusted-only unless the
 	// repository explicitly opts into pushed settings.
-	AutoFix AutoFixRaw `yaml:"auto_fix"`
-	CI      CIRaw      `yaml:"ci"`
-	Commit  CommitRaw  `yaml:"commit"`
-	Intent  IntentRaw  `yaml:"intent"`
-	Test    TestRaw    `yaml:"test"`
-	PR      PRRaw      `yaml:"pr"`
+	AutoFix   AutoFixRaw   `yaml:"auto_fix"`
+	MaxRounds MaxRoundsRaw `yaml:"max_rounds"`
+	CI        CIRaw        `yaml:"ci"`
+	Commit    CommitRaw    `yaml:"commit"`
+	Intent    IntentRaw    `yaml:"intent"`
+	Test      TestRaw      `yaml:"test"`
+	PR        PRRaw        `yaml:"pr"`
 	// Document carries the repository's documentation placement policy. It
 	// steers the document step's gate prompt, so it is honored ONLY from the
 	// trusted default-branch copy of .no-mistakes.yaml (see
@@ -394,20 +397,21 @@ func RenderedInstructions(instructions string) string {
 
 func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	type repoConfigRaw struct {
-		Agent                  agentList   `yaml:"agent"`
-		Commands               Commands    `yaml:"commands"`
-		IgnorePatterns         []string    `yaml:"ignore_patterns"`
-		AllowRepoCommands      bool        `yaml:"allow_repo_commands"`
-		AutoFix                AutoFixRaw  `yaml:"auto_fix"`
-		CI                     CIRaw       `yaml:"ci"`
-		Commit                 CommitRaw   `yaml:"commit"`
-		Intent                 IntentRaw   `yaml:"intent"`
-		Test                   TestRaw     `yaml:"test"`
-		PR                     PRRaw       `yaml:"pr"`
-		Document               DocumentRaw `yaml:"document"`
-		Review                 ReviewRaw   `yaml:"review"`
-		DisableProjectSettings bool        `yaml:"disable_project_settings"`
-		NoCI                   bool        `yaml:"no_ci"`
+		Agent                  agentList    `yaml:"agent"`
+		Commands               Commands     `yaml:"commands"`
+		IgnorePatterns         []string     `yaml:"ignore_patterns"`
+		AllowRepoCommands      bool         `yaml:"allow_repo_commands"`
+		AutoFix                AutoFixRaw   `yaml:"auto_fix"`
+		MaxRounds              MaxRoundsRaw `yaml:"max_rounds"`
+		CI                     CIRaw        `yaml:"ci"`
+		Commit                 CommitRaw    `yaml:"commit"`
+		Intent                 IntentRaw    `yaml:"intent"`
+		Test                   TestRaw      `yaml:"test"`
+		PR                     PRRaw        `yaml:"pr"`
+		Document               DocumentRaw  `yaml:"document"`
+		Review                 ReviewRaw    `yaml:"review"`
+		DisableProjectSettings bool         `yaml:"disable_project_settings"`
+		NoCI                   bool         `yaml:"no_ci"`
 	}
 	var raw repoConfigRaw
 	if err := value.Decode(&raw); err != nil {
@@ -419,6 +423,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.IgnorePatterns = raw.IgnorePatterns
 	c.AllowRepoCommands = raw.AllowRepoCommands
 	c.AutoFix = raw.AutoFix
+	c.MaxRounds = raw.MaxRounds
 	c.CI = raw.CI
 	c.Commit = raw.Commit
 	c.Intent = raw.Intent
@@ -448,6 +453,41 @@ type AutoFixRaw struct {
 	CI       *int `yaml:"ci"`
 	Babysit  *int `yaml:"babysit"`
 	Rebase   *int `yaml:"rebase"`
+}
+
+// MaxRoundsRaw is the YAML representation of the per-step round budget.
+// Pointer fields distinguish "not set" (nil) from "set to 0" (unlimited).
+type MaxRoundsRaw struct {
+	Lint     *int `yaml:"lint"`
+	Test     *int `yaml:"test"`
+	Review   *int `yaml:"review"`
+	Document *int `yaml:"document"`
+	CI       *int `yaml:"ci"`
+	Rebase   *int `yaml:"rebase"`
+}
+
+// MaxRounds holds the resolved per-step total round budget for one run.
+//
+// A round is one full execution of the step: the initial pass plus every
+// fix-and-recheck pass, no matter who asked for it. auto_fix caps only the
+// automatic fix rounds the executor starts on its own; an agent answering
+// `axi respond --action fix` at each gate can otherwise loop without bound,
+// and a thorough reviewer on a large diff can keep substantiating new findings
+// indefinitely, so the loop's fixed point may not exist for a given
+// model-effort-diff combination.
+//
+// A value of 0 means unlimited, which is the historical behavior and stays the
+// default. When a positive budget is exhausted, the step does not approve
+// itself and does not downgrade any finding's severity: it parks the remaining
+// findings at its gate and refuses further fix rounds, so the decision to
+// approve, skip, or abort moves to the human or agent driving the run.
+type MaxRounds struct {
+	Lint     int
+	Test     int
+	Review   int
+	Document int
+	CI       int
+	Rebase   int
 }
 
 // CIRaw is the YAML representation of CI-step settings.
@@ -502,6 +542,7 @@ type Config struct {
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
+	MaxRounds             MaxRounds
 	CI                    CI
 	Commit                Commit
 	Intent                Intent
@@ -850,6 +891,18 @@ auto_fix:
   review: 0
   document: 3
   ci: 3
+
+# Total rounds a step may run in one run: the initial pass plus every
+# fix-and-recheck pass, whether the pipeline started it or an agent asked for it
+# at a gate. 0 (the default) means unlimited. auto_fix bounds only the automatic
+# fix rounds, so an agent answering "axi respond --action fix" at every gate is
+# otherwise unbounded - and a thorough reviewer on a large change can keep
+# substantiating new findings pass after pass, with each round re-reading the
+# whole change. When the budget is spent the step parks: the remaining findings
+# stay blocking at its gate with none of them downgraded, the fix action is
+# refused, and you decide whether to approve, skip, or abort.
+max_rounds:
+  review: 0
 
 # How many times the CI step may re-run a single check the provider reported as
 # cancelled before that check reaches an approval gate instead of the fix agent.
@@ -1846,6 +1899,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		raw.AutoFix.CI = raw.AutoFix.Babysit
 	}
 	cfg.AutoFix = raw.AutoFix
+	cfg.MaxRounds = raw.MaxRounds
 	cfg.CI = raw.CI
 	cfg.Commit = raw.Commit
 	cfg.Intent = raw.Intent
@@ -2381,6 +2435,56 @@ func autoFixDefaults() AutoFix {
 	}
 }
 
+// maxRoundsDefaults returns the default per-step round budget. Every step is
+// unlimited by default so enabling a budget is always an explicit choice.
+func maxRoundsDefaults() MaxRounds {
+	return MaxRounds{}
+}
+
+// applyMaxRoundsOverrides applies non-nil raw values onto resolved defaults.
+// A negative value is clamped to 0 (unlimited) rather than inverting the bound.
+func applyMaxRoundsOverrides(dst *MaxRounds, src *MaxRoundsRaw) {
+	if src.Lint != nil {
+		dst.Lint = max(*src.Lint, 0)
+	}
+	if src.Test != nil {
+		dst.Test = max(*src.Test, 0)
+	}
+	if src.Review != nil {
+		dst.Review = max(*src.Review, 0)
+	}
+	if src.Document != nil {
+		dst.Document = max(*src.Document, 0)
+	}
+	if src.CI != nil {
+		dst.CI = max(*src.CI, 0)
+	}
+	if src.Rebase != nil {
+		dst.Rebase = max(*src.Rebase, 0)
+	}
+}
+
+// MaxRoundsLimit returns the total round budget for a given step, or 0 when
+// the step's rounds are unlimited.
+func (c *Config) MaxRoundsLimit(step types.StepName) int {
+	switch step {
+	case types.StepLint:
+		return c.MaxRounds.Lint
+	case types.StepTest:
+		return c.MaxRounds.Test
+	case types.StepReview:
+		return c.MaxRounds.Review
+	case types.StepDocument:
+		return c.MaxRounds.Document
+	case types.StepCI:
+		return c.MaxRounds.CI
+	case types.StepRebase:
+		return c.MaxRounds.Rebase
+	default:
+		return 0
+	}
+}
+
 // ciDefaults returns the default CI-step settings. Rerunning cancelled checks
 // is off by default: a CANCELLED conclusion does not say who cancelled, so the
 // safe baseline is to escalate rather than risk restarting a job a maintainer
@@ -2452,6 +2556,10 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	applyAutoFixOverrides(&af, &global.AutoFix)
 	applyAutoFixOverrides(&af, &repo.AutoFix)
 
+	mr := maxRoundsDefaults()
+	applyMaxRoundsOverrides(&mr, &global.MaxRounds)
+	applyMaxRoundsOverrides(&mr, &repo.MaxRounds)
+
 	ci := ciDefaults()
 	// The operator's global value is a machine-wide floor they can always set;
 	// the repo value is trusted-only (EffectiveRepoConfig sourced it from the
@@ -2502,6 +2610,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,
+		MaxRounds:      mr,
 		CI:             ci,
 		Commit:         commit,
 		Intent:         intent,

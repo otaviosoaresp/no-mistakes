@@ -89,6 +89,7 @@ type stepView struct {
 	RoundCount       int
 	FixRoundCount    int
 	AutoFixLimit     int
+	MaxRounds        int
 	PendingFixSource string
 	QuietWarning     time.Duration
 }
@@ -134,6 +135,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			RoundCount:       s.RoundCount,
 			FixRoundCount:    s.FixRoundCount,
 			AutoFixLimit:     s.AutoFixLimit,
+			MaxRounds:        s.MaxRounds,
 			PendingFixSource: s.PendingFixSource,
 		}
 		if s.LastActivity != nil {
@@ -172,6 +174,9 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
 		}
 		if s.AutoFixLimit != nil {
 			sv.AutoFixLimit = *s.AutoFixLimit
+		}
+		if s.MaxRounds != nil {
+			sv.MaxRounds = *s.MaxRounds
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -469,17 +474,38 @@ func gateFields(gate stepView) []toon.Field {
 	}
 	gfields = append(gfields, toon.Field{Key: "findings", Value: rows})
 
+	// A spent round budget withdraws the fix action and nothing else: the
+	// findings above still block, so the gate is telling the agent to decide
+	// rather than to fix again. Offering `--action fix` here would only send
+	// the driver into a refusal the executor logs and re-parks.
+	budgetSpent := gateRoundBudgetSpent(gate)
+	if budgetSpent {
+		gfields = append(gfields, toon.Field{Key: "round_budget", Value: fmt.Sprintf("spent (%d/%d) - `--action fix` is refused for this step; decide with approve, skip, or abort, or raise `max_rounds.%s` in config", gate.RoundCount, gate.MaxRounds, gate.Name)})
+	}
+
+	help := []string{"Run `no-mistakes axi respond --action approve` to accept this step and continue"}
+	if !budgetSpent {
+		help = append(help, "Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)")
+	}
+	help = append(help,
+		"Run `no-mistakes axi respond --action skip` to skip this step",
+		fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
+		"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
+		preserveGateFixCommitsGuidance,
+	)
+
 	return []toon.Field{
 		{Key: "gate", Value: toon.NewObject(gfields...)},
-		{Key: "help", Value: []string{
-			"Run `no-mistakes axi respond --action approve` to accept this step and continue",
-			"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
-			"Run `no-mistakes axi respond --action skip` to skip this step",
-			fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
-			"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
-			preserveGateFixCommitsGuidance,
-		}},
+		{Key: "help", Value: help},
 	}
+}
+
+// gateRoundBudgetSpent reports whether the step at this gate has run its whole
+// round budget. An unknown round count (0, from a view built without round
+// data) reads as not spent, so the fix option is only ever withheld on
+// positive evidence; the executor refuses and re-parks either way.
+func gateRoundBudgetSpent(gate stepView) bool {
+	return gate.MaxRounds > 0 && gate.RoundCount >= gate.MaxRounds
 }
 
 // truncate shortens s to limit runes, appending a disclosure of the full size

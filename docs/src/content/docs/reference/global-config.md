@@ -73,6 +73,9 @@ auto_fix:
   lint: 3
   ci: 3
 
+max_rounds:
+  review: 0
+
 ci:
   rerun_transient: 0
 
@@ -541,6 +544,34 @@ For empty `commands.lint`, the document step's combined housekeeping pass also a
 Legacy alias: `auto_fix.babysit`.
 
 These are global defaults. Per-repo config can override individual steps.
+
+### max_rounds
+
+Total round budget per step for one run. A round is one full execution of the step: the initial pass plus every fix-and-recheck pass, whether the pipeline started it automatically or an agent asked for it at a gate. `0` means unlimited, which is the default and the historical behavior.
+
+`auto_fix` bounds only the automatic fix rounds. An agent answering `axi respond --action fix` at each gate is otherwise unbounded, and a thorough reviewer on a large change can keep substantiating new findings pass after pass, so the loop may have no fixed point for a given model, effort, and diff. Each round re-reads the whole change, so an unbounded loop is also the largest single cost in a run.
+
+When a positive budget is spent, the step **parks**: it does not approve itself and it does not downgrade any finding's severity. The remaining findings stay blocking at the gate, `axi status` reports `round_budget: spent`, and `--action fix` is refused for that step, so the decision to approve, skip, or abort moves to whoever is driving the run. `axi run --yes` approves such a gate, the same way it already approves a gate it has fixed once.
+
+|      |          |
+| ---- | -------- |
+| Type | `object` |
+
+| Field                 | Type  | Default | Description                          |
+| --------------------- | ----- | ------- | ------------------------------------ |
+| `max_rounds.review`   | `int` | `0`     | Total review rounds, `0` = unlimited |
+| `max_rounds.test`     | `int` | `0`     | Total test rounds, `0` = unlimited   |
+| `max_rounds.lint`     | `int` | `0`     | Total lint rounds, `0` = unlimited   |
+| `max_rounds.document` | `int` | `0`     | Total document rounds, `0` = unlimited |
+| `max_rounds.ci`       | `int` | `0`     | Total CI rounds, `0` = unlimited     |
+| `max_rounds.rebase`   | `int` | `0`     | Total rebase rounds, `0` = unlimited |
+
+```yaml
+max_rounds:
+  review: 4
+```
+
+A negative value is clamped to `0`. These are global defaults; per-repo config can override individual steps.
 
 ### ci.rerun_transient
 

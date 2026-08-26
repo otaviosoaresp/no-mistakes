@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS step_results (
     last_activity    TEXT,
     agent_pid        INTEGER,
     auto_fix_limit   INTEGER,
+    max_rounds       INTEGER,
     ci_fix_attempts  INTEGER NOT NULL DEFAULT 0
 );
 
@@ -225,6 +226,9 @@ var migrationStatements = []string{
 	`ALTER TABLE step_results ADD COLUMN last_activity TEXT`,
 	`ALTER TABLE step_results ADD COLUMN agent_pid INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN auto_fix_limit INTEGER`,
+	// Nullable: NULL means this step's rounds are unlimited, which is both the
+	// default and how every row written before the budget existed reads back.
+	`ALTER TABLE step_results ADD COLUMN max_rounds INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN ci_fix_attempts INTEGER NOT NULL DEFAULT 0`,
 	// Session-fidelity telemetry columns (all nullable so pre-existing rows read
 	// back as unknown, never a fabricated zero).
