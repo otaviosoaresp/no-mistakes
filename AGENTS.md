@@ -2,6 +2,8 @@
 
 This file is for agentic coding tools working in this repo.
 
+**This is a private-use fork of `kunchenguid/no-mistakes`.** Its local changes are kept here and are never proposed upstream: do not open a pull request against `kunchenguid/no-mistakes`, and do not treat an upstream issue number in a commit message as a contribution in flight. `FORK.md` owns what diverges, the build-and-install procedure for replacing the released binary, and the upstream merge rule (merge, never squash or rebase). Everything else in this file is upstream's contract and still applies.
+
 This repository is a Go CLI app named `no-mistakes`.
 The binary entrypoint is `cmd/no-mistakes`; implementation code lives under `internal/`, and the package names there are the layout map (CLI in `internal/cli`, daemon in `internal/daemon`, pipeline and steps in `internal/pipeline`, agent adapters in `internal/agent`, terminal UI in `internal/tui`, shared infrastructure in `internal/git`, `internal/ipc`, `internal/config`, `internal/db`, `internal/paths`, `internal/types`).
 Build, test, and release commands are owned by the `Makefile`; read it for the full target list instead of relying on a copy here.

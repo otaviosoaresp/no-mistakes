@@ -1,5 +1,7 @@
 # Contributing
 
+> **Fork note.** This repository is a private-use fork of [`kunchenguid/no-mistakes`](https://github.com/kunchenguid/no-mistakes). Its local changes are kept here and are not proposed upstream, so the process below applies to the upstream project rather than to this fork - see [FORK.md](FORK.md). Contributions intended for the real project belong in the upstream repository.
+
 Thanks for wanting to contribute. One rule up front:
 
 **All pull requests to this repository must be raised through `no-mistakes`.**

@@ -30,6 +30,11 @@
 
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
+> **This is a private-use fork of [`kunchenguid/no-mistakes`](https://github.com/kunchenguid/no-mistakes).**
+> It carries two local changes - a `max_rounds` round budget per step, and honoring `CLAUDE_CONFIG_DIR` on skill install - which are kept here and are not proposed upstream.
+> See [FORK.md](FORK.md) for what diverges, how to build and install over a released binary, and how to merge upstream.
+> Everything below is upstream's documentation and describes the released tool.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/demo.gif" alt="no-mistakes demo" width="800" />
 </p>
