@@ -12,9 +12,48 @@ import (
 // Code's personal-skill location (OpenCode reads it too); `~/.agents/skills`
 // is the vendor-neutral user-level convention Codex, OpenCode, Rovo Dev, and
 // Pi all read.
+//
+// The Claude base is the default only: CLAUDE_CONFIG_DIR relocates Claude
+// Code's entire personal config directory, so InstallTargets resolves that
+// base through ClaudeConfigDir. InstallBases stays home-relative because
+// Vendored reports legacy in-repo copies, which were always written at these
+// fixed repo-relative paths.
 var InstallBases = []string{
 	filepath.Join(".claude", "skills"),
 	filepath.Join(".agents", "skills"),
+}
+
+// ClaudeConfigDirEnv is the environment variable Claude Code reads to relocate
+// its personal configuration directory (profile setups point it at, for
+// example, ~/.claude-work). Honoring it keeps the installed skill in the same
+// profile the user's Claude Code session actually reads.
+const ClaudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
+
+// ClaudeConfigDir returns the Claude Code personal configuration directory for
+// the given root (normally the user's home directory). A set, non-empty
+// CLAUDE_CONFIG_DIR wins; a relative value is resolved against the current
+// working directory, matching how Claude Code itself interprets it. An
+// unresolvable value falls back to the default so a bad env var can never turn
+// a skill install into a hard failure.
+func ClaudeConfigDir(root string) string {
+	dir := strings.TrimSpace(os.Getenv(ClaudeConfigDirEnv))
+	if dir == "" {
+		return filepath.Join(root, ".claude")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return filepath.Join(root, ".claude")
+	}
+	return abs
+}
+
+// InstallTargets returns the absolute skill parent directories Install writes
+// to under root, in install order.
+func InstallTargets(root string) []string {
+	return []string{
+		filepath.Join(ClaudeConfigDir(root), "skills"),
+		filepath.Join(root, ".agents", "skills"),
+	}
 }
 
 // InstallUser installs the skill into the agent skill directories under the
@@ -40,10 +79,10 @@ func InstallUser() ([]string, error) {
 // symlink). Both logical bases stay readable afterward via the link.
 func Install(root string) ([]string, error) {
 	content := []byte(Markdown())
-	written := make([]string, 0, len(InstallBases))
-	for _, base := range InstallBases {
-		rel := filepath.Join(base, Name, "SKILL.md")
-		path := filepath.Join(root, rel)
+	targets := InstallTargets(root)
+	written := make([]string, 0, len(targets))
+	for _, target := range targets {
+		path := filepath.Join(target, Name, "SKILL.md")
 		// Resolve any symlink components to a real directory before creating
 		// it, so a dangling symlink in the path does not collide with MkdirAll.
 		realDir, err := resolveThroughSymlinks(filepath.Dir(path))
@@ -56,9 +95,21 @@ func Install(root string) ([]string, error) {
 		if err := os.WriteFile(filepath.Join(realDir, "SKILL.md"), content, 0o644); err != nil {
 			return written, err
 		}
-		written = append(written, rel)
+		written = append(written, displayPath(root, path))
 	}
 	return written, nil
+}
+
+// displayPath reports path relative to root when it lives under root, and
+// absolute otherwise. A CLAUDE_CONFIG_DIR outside the home directory has no
+// meaningful home-relative form, so the caller shows the user where the file
+// actually landed instead of a misleading ../.. path.
+func displayPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return path
+	}
+	return rel
 }
 
 // Vendored reports the repo-relative paths of legacy vendored skill copies

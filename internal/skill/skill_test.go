@@ -9,6 +9,15 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 )
 
+// withDefaultClaudeConfigDir pins the Claude base back to <root>/.claude for a
+// test that asserts the default layout. Without it, a CLAUDE_CONFIG_DIR set in
+// the developer's own shell would redirect the install out of the temp root
+// and into their real profile directory.
+func withDefaultClaudeConfigDir(t *testing.T) {
+	t.Helper()
+	t.Setenv(ClaudeConfigDirEnv, "")
+}
+
 func TestMarkdownFrontmatter(t *testing.T) {
 	md := Markdown()
 	if !strings.HasPrefix(md, "---\n") {
@@ -92,6 +101,7 @@ func TestBodyDocumentsAxiGateGuidance(t *testing.T) {
 }
 
 func TestInstallWritesBothPaths(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	root := t.TempDir()
 	written, err := Install(root)
 	if err != nil {
@@ -121,6 +131,7 @@ func TestInstallWritesBothPaths(t *testing.T) {
 // TestInstallUserWritesUnderHome proves the init entry point resolves the
 // user's home directory and installs there, never into the working directory.
 func TestInstallUserWritesUnderHome(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	home := t.TempDir()
 	// os.UserHomeDir reads HOME on Unix and USERPROFILE on Windows; set both
 	// so the test isolates the real home directory on every platform.
@@ -146,6 +157,7 @@ func TestInstallUserWritesUnderHome(t *testing.T) {
 }
 
 func TestInstallIsIdempotent(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	root := t.TempDir()
 	if _, err := Install(root); err != nil {
 		t.Fatalf("first install: %v", err)
@@ -169,6 +181,7 @@ func TestInstallIsIdempotent(t *testing.T) {
 // reachable via both logical bases - including when the symlink target dir
 // does not exist yet.
 func TestInstallSymlinkLayouts(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	tests := []struct {
 		name  string
 		setup func(t *testing.T, root string)
@@ -252,6 +265,7 @@ func TestInstallSymlinkLayouts(t *testing.T) {
 // left by a previous binary version must be refreshed to current content when
 // Install runs again.
 func TestInstallOverwritesStaleContent(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	root := t.TempDir()
 	stale := filepath.Join(root, ".claude", "skills", Name, "SKILL.md")
 	mkdirAll(t, filepath.Dir(stale))
@@ -271,6 +285,7 @@ func TestInstallOverwritesStaleContent(t *testing.T) {
 }
 
 func TestInstallRejectsSymlinkCycle(t *testing.T) {
+	withDefaultClaudeConfigDir(t)
 	root := t.TempDir()
 	symlink(t, ".agents", filepath.Join(root, ".claude"))
 	symlink(t, ".claude", filepath.Join(root, ".agents"))
