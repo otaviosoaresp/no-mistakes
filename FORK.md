@@ -76,6 +76,30 @@ Schema migrations are additive and run automatically on the next daemon start. R
 
 `no-mistakes update` pulls an upstream release and will overwrite the fork build. After running it, rebuild and reinstall from here.
 
+## Installing on a remote host
+
+There is no Go toolchain on the Coder workspace, so the binary is cross-compiled here and shipped. `CGO_ENABLED=0` is what makes that work at all: the SQLite driver is `modernc.org/sqlite`, pure Go, so the result is a static ELF with no runtime dependency on the target.
+
+```sh
+VERSION=$(git describe --tags --always --dirty)
+COMMIT=$(git rev-parse --short HEAD)
+DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+  -ldflags "-X github.com/kunchenguid/no-mistakes/internal/buildinfo.Version=$VERSION \
+            -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Commit=$COMMIT \
+            -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Date=$DATE" \
+  -o no-mistakes-linux-arm64 ./cmd/no-mistakes
+
+scp no-mistakes-linux-arm64 <host>:/tmp/no-mistakes-fork
+```
+
+Match `GOARCH` to the target - the Coder workspace is `aarch64`, this machine is `amd64`. Compare `sha256sum` on both ends before installing, then follow the same stop, back up, replace, start sequence as above, and finish with `no-mistakes init` from a registered repository to refresh the skill.
+
+Persistence on the Coder workspace: `/home` is its own volume, so `~/.no-mistakes` and the `~/.local/bin/no-mistakes` symlink survive a stop and start, and no template or dotfiles script reinstalls the released binary over ours. `no-mistakes update` still would.
+
+The operator config is per host and does not travel with the binary - set `max_rounds` on each machine separately.
+
 ## Staying current with upstream
 
 **Always merge, never squash or rebase.** A squash flattens the shared history and the next merge then reports every upstream file as a conflict.
