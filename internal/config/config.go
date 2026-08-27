@@ -117,7 +117,7 @@ type GlobalConfig struct {
 	// agent_args_override: it describes this machine's agent setup and decides
 	// which model runs with the operator's credentials, so no pushed branch may
 	// set it.
-	AgentConfig map[string]agentcfg.Profile `yaml:"agent_config"`
+	AgentConfig map[string]AgentTuning `yaml:"agent_config"`
 	// WorktreeRoots places a repository's pipeline run worktrees under a
 	// directory the operator chose instead of the default
 	// <NM_HOME>/worktrees/<repoID>. Keys are registered checkout paths
@@ -530,7 +530,7 @@ type Config struct {
 	ACPRegistryOverrides  map[string]string
 	AgentPathOverride     map[string]string
 	AgentArgsOverride     map[string][]string
-	AgentConfig           map[string]agentcfg.Profile
+	AgentConfig           map[string]AgentTuning
 	CITimeout             time.Duration
 	StepQuietWarning      time.Duration
 	AgentTimeout          time.Duration
@@ -856,6 +856,26 @@ log_level: info
 #   opencode:
 #     model: openai/gpt-5
 #
+# Model and reasoning effort per agent, in one common spelling. no-mistakes maps
+# each field down to whatever mechanism that harness actually uses.
+# agent_args_override still wins for any knob it pins natively.
+#
+# purposes narrows model/effort for individual duties within one agent's entry,
+# as a delta on the base above: an override that sets only effort keeps the
+# model. Valid names are every step (intent, rebase, review, test, document,
+# lint, push, pr, ci) plus review-fix, test-fix, lint-fix, document-fix, and
+# housekeeping. A duty you do not name runs on the base profile.
+# Run "no-mistakes stats" to see where a run's tokens actually go first.
+# agent_config:
+#   claude:
+#     model: claude-opus-5
+#     effort: xhigh
+#     purposes:
+#       review-fix:
+#         effort: medium
+#       housekeeping:
+#         effort: low
+
 # Extra native agent CLI flags (optional, global only)
 # Codex service_tier controls speed/priority; model_reasoning_effort controls reasoning depth.
 # A flag here always wins over the same knob in agent_config, so an existing
@@ -1346,7 +1366,35 @@ func (c *Config) AgentProfileFor(name types.AgentName) agentcfg.Profile {
 	if c.AgentConfig == nil {
 		return agentcfg.Profile{}
 	}
-	return c.AgentConfig[string(name)]
+	return c.AgentConfig[string(name)].Base
+}
+
+// AgentProfileForPurpose returns the profile one agent runs a given purpose
+// under. An agent with no purpose override for it, or an empty purpose, gets
+// the agent's base profile, so the result is identical to AgentProfileFor for
+// every configuration written before purposes existed.
+func (c *Config) AgentProfileForPurpose(name types.AgentName, purpose string) agentcfg.Profile {
+	if c.AgentConfig == nil {
+		return agentcfg.Profile{}
+	}
+	return c.AgentConfig[string(name)].ProfileFor(purpose)
+}
+
+// NarrowedPurposes returns every purpose at least one configured agent
+// narrows. The pipeline builds a dedicated agent only for these, so a purpose
+// nobody tuned keeps running on the base instance instead of an identical
+// duplicate of it.
+func (c *Config) NarrowedPurposes() map[string]bool {
+	var narrowed map[string]bool
+	for _, tuning := range c.AgentConfig {
+		for purpose := range tuning.Purposes {
+			if narrowed == nil {
+				narrowed = map[string]bool{}
+			}
+			narrowed[purpose] = true
+		}
+	}
+	return narrowed
 }
 
 // agentProfileRaw is the on-disk YAML shape of one agent_config entry. Effort
@@ -1355,31 +1403,110 @@ func (c *Config) AgentProfileFor(name types.AgentName) agentcfg.Profile {
 type agentProfileRaw struct {
 	Model  string `yaml:"model"`
 	Effort string `yaml:"effort"`
+	// Purposes narrows model and effort for individual agent duties within
+	// this agent's entry. It nests under the agent rather than standing on its
+	// own because a model name is harness-specific: with an ordered fallback
+	// list, one purpose-level model string cannot serve both harnesses.
+	Purposes map[string]purposeProfileRaw `yaml:"purposes"`
+}
+
+// purposeProfileRaw is one purpose override. It deliberately has no nested
+// purposes of its own.
+type purposeProfileRaw struct {
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
+}
+
+// AgentTuning is one resolved agent_config entry: the agent's base profile
+// plus any per-purpose narrowing already layered over that base, so a lookup
+// is a map read rather than a merge at invocation time.
+type AgentTuning struct {
+	Base agentcfg.Profile
+	// Purposes holds fully resolved profiles, keyed by types.AgentPurpose. An
+	// absent purpose means the base applies unchanged.
+	Purposes map[string]agentcfg.Profile
+}
+
+// IsZero reports whether the entry asks for nothing at all.
+func (t AgentTuning) IsZero() bool { return t.Base.IsZero() && len(t.Purposes) == 0 }
+
+// ProfileFor returns the profile to run one purpose under, falling back to the
+// agent's base profile.
+func (t AgentTuning) ProfileFor(purpose string) agentcfg.Profile {
+	if profile, ok := t.Purposes[purpose]; ok {
+		return profile
+	}
+	return t.Base
 }
 
 // parseAgentConfig validates the agent_config map and resolves it to
 // harness-neutral profiles. Every knob is checked against what the named
 // harness can actually express, so an unmappable request fails at load rather
 // than being silently dropped at run time.
-func parseAgentConfig(raw map[string]agentProfileRaw) (map[string]agentcfg.Profile, error) {
-	profiles := make(map[string]agentcfg.Profile, len(raw))
+func parseAgentConfig(raw map[string]agentProfileRaw) (map[string]AgentTuning, error) {
+	tunings := make(map[string]AgentTuning, len(raw))
 	for name, entry := range raw {
 		agentName := types.AgentName(name)
 		if !agentcfg.Known(agentName) {
 			return nil, fmt.Errorf("invalid agent name in agent_config: %q (valid: %s, cursor, acp:<target>)", name, strings.Join(agentNamesText(agentcfg.Agents()), ", "))
 		}
-		effort, err := agentcfg.ParseEffort(entry.Effort)
+		base, err := parseProfile(entry.Model, entry.Effort)
 		if err != nil {
 			return nil, fmt.Errorf("invalid agent_config.%s: %w", name, err)
 		}
-		profile := agentcfg.Profile{Model: strings.TrimSpace(entry.Model), Effort: effort}
-		if err := agentcfg.Validate(agentName, profile); err != nil {
+		if err := agentcfg.Validate(agentName, base); err != nil {
 			return nil, fmt.Errorf("invalid agent_config.%s: %w", name, err)
 		}
-		if profile.IsZero() {
+		purposes, err := parsePurposeProfiles(agentName, name, base, entry.Purposes)
+		if err != nil {
+			return nil, err
+		}
+		tuning := AgentTuning{Base: base, Purposes: purposes}
+		if tuning.IsZero() {
 			continue
 		}
-		profiles[name] = profile
+		tunings[name] = tuning
+	}
+	if len(tunings) == 0 {
+		return nil, nil
+	}
+	return tunings, nil
+}
+
+func parseProfile(model, effort string) (agentcfg.Profile, error) {
+	parsed, err := agentcfg.ParseEffort(effort)
+	if err != nil {
+		return agentcfg.Profile{}, err
+	}
+	return agentcfg.Profile{Model: strings.TrimSpace(model), Effort: parsed}, nil
+}
+
+// parsePurposeProfiles resolves each purpose override against the agent's base
+// profile. An unknown purpose name is a load error rather than an override that
+// would silently never match an invocation, and every resolved profile is
+// validated against the same harness the base was, so a purpose cannot smuggle
+// in a knob the harness cannot express.
+func parsePurposeProfiles(agentName types.AgentName, key string, base agentcfg.Profile, raw map[string]purposeProfileRaw) (map[string]agentcfg.Profile, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	profiles := make(map[string]agentcfg.Profile, len(raw))
+	for purpose, entry := range raw {
+		if !types.KnownAgentPurpose(purpose) {
+			return nil, fmt.Errorf("invalid purpose in agent_config.%s.purposes: %q (valid: %s)", key, purpose, strings.Join(types.AgentPurposeNames(), ", "))
+		}
+		override, err := parseProfile(entry.Model, entry.Effort)
+		if err != nil {
+			return nil, fmt.Errorf("invalid agent_config.%s.purposes.%s: %w", key, purpose, err)
+		}
+		if override.IsZero() {
+			continue
+		}
+		resolved := base.OverrideWith(override)
+		if err := agentcfg.Validate(agentName, resolved); err != nil {
+			return nil, fmt.Errorf("invalid agent_config.%s.purposes.%s: %w", key, purpose, err)
+		}
+		profiles[purpose] = resolved
 	}
 	if len(profiles) == 0 {
 		return nil, nil

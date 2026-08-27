@@ -241,6 +241,31 @@ How each field maps:
 
 `agent_config` is global-only. Like `agent_args_override`, it decides which model runs with your credentials, so an `agent_config` block in a repository's `.no-mistakes.yaml` is ignored.
 
+#### purposes
+
+A step can invoke the agent for more than one job, and those jobs differ enough to tune separately: the reviewer reads a whole diff adversarially, its fixer applies findings it was handed, and the housekeeping pass edits documentation. `purposes` narrows `model` and `effort` for individual duties inside one agent's entry.
+
+```yaml
+agent_config:
+  claude:
+    model: claude-opus-5
+    effort: xhigh          # every purpose, unless narrowed below
+    purposes:
+      review-fix:
+        effort: medium     # keeps the model above
+      housekeeping:
+        model: claude-sonnet-5
+        effort: low
+```
+
+A purpose entry is a **delta on that agent's base profile**, not a replacement: an override that sets only `effort` keeps the model the agent is configured with. A purpose nobody names runs on the base profile, so adding `purposes` never changes a duty you did not mention.
+
+It nests under the agent rather than standing on its own because a model name is harness-specific. With an ordered fallback list such as `agent: [codex, claude]`, one purpose-level model string could not serve both harnesses.
+
+Valid purpose names are every pipeline step - `intent`, `rebase`, `review`, `test`, `document`, `lint`, `push`, `pr`, `ci` - plus the named duties `review-fix`, `test-fix`, `lint-fix`, `document-fix`, and `housekeeping` (the combined documentation and lint pass the document step runs when `commands.lint` is empty). A name outside that set is a config error rather than an override that would silently never match, and each resolved profile is validated against the same harness the base profile is, so a purpose cannot request a knob the harness cannot express.
+
+The purpose an invocation carries is recorded per invocation in `agent_invocations.purpose`; read it with `no-mistakes stats` to see where a run's tokens actually go before choosing what to narrow.
+
 **Precedence.** `agent_args_override` always wins. If a raw flag already pins a knob natively - for example, `-m`, `--model`, or a `-c`/`--config` assignment whose exact key is `model` or `model_reasoning_effort` for Codex, plus the other harnesses' `--effort`, `--reasoning-effort`, or `--thinking` forms - then `agent_config` does not emit its value for that knob. Text such as `model=` nested inside an unrelated option's value is not a pin. Any knob the raw flags leave alone still comes from `agent_config`, so adding `agent_config` to an existing configuration never changes the arguments that configuration already supplied:
 
 ```yaml

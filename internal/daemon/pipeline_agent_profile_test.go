@@ -18,7 +18,7 @@ import (
 func TestNewPipelineAgent_ThreadsTheAgentProfile(t *testing.T) {
 	cfg := &config.Config{
 		Agent:       types.AgentAntigravity,
-		AgentConfig: map[string]agentcfg.Profile{"antigravity": {Model: "some-model"}},
+		AgentConfig: map[string]config.AgentTuning{"antigravity": {Base: agentcfg.Profile{Model: "some-model"}}},
 	}
 	_, err := newPipelineAgent(context.Background(), cfg, t.TempDir(), fakeLookPath, runenv.Overlay{})
 	if err == nil {
@@ -32,7 +32,7 @@ func TestNewPipelineAgent_ThreadsTheAgentProfile(t *testing.T) {
 func TestNewPipelineAgent_ProfileIsPerAgent(t *testing.T) {
 	cfg := &config.Config{
 		Agents:      []types.AgentName{types.AgentClaude, types.AgentAntigravity},
-		AgentConfig: map[string]agentcfg.Profile{"claude": {Model: "sonnet", Effort: agentcfg.EffortHigh}},
+		AgentConfig: map[string]config.AgentTuning{"claude": {Base: agentcfg.Profile{Model: "sonnet", Effort: agentcfg.EffortHigh}}},
 	}
 	ag, err := newPipelineAgent(context.Background(), cfg, t.TempDir(), fakeLookPath, runenv.Overlay{})
 	if err != nil {

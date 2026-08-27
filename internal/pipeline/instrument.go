@@ -43,6 +43,14 @@ func (a *perfRecordingAgent) SupportsSessionProvider(provider string) bool {
 }
 
 func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	// Default the purpose here, at the outermost wrapper, rather than only when
+	// recording: several steps invoke the agent without naming one, and a
+	// purpose that exists solely in the telemetry row cannot route the
+	// invocation. Defaulting once means the duty that dispatches is exactly the
+	// duty that is recorded.
+	if opts.Purpose == "" {
+		opts.Purpose = string(a.stepName)
+	}
 	attempts := 0
 	previous := opts.OnAttempt
 	opts.OnAttempt = func(attempt agent.Attempt) {
@@ -68,6 +76,8 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 		return
 	}
 
+	// Run defaults an empty purpose to the step name before delegating, so by
+	// here it is set; the fallback stays for direct record callers in tests.
 	purpose := opts.Purpose
 	if purpose == "" {
 		purpose = string(a.stepName)
