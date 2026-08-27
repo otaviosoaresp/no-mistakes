@@ -55,8 +55,8 @@ agent_config:
 		"cursor": {Model: "gpt-5"},
 	}
 	for name, wantProfile := range want {
-		if got := cfg.AgentConfig[name]; got != wantProfile {
-			t.Errorf("AgentConfig[%q] = %#v, want %#v", name, got, wantProfile)
+		if got := cfg.AgentConfig[name].Base; got != wantProfile {
+			t.Errorf("AgentConfig[%q].Base = %#v, want %#v", name, got, wantProfile)
 		}
 	}
 }
@@ -87,7 +87,7 @@ func TestLoadGlobal_AgentConfigRejectsBadInput(t *testing.T) {
 
 func TestLoadGlobal_AgentConfigAcceptsExplicitACPTarget(t *testing.T) {
 	cfg := writeGlobalConfig(t, "agent_config:\n  acp:gemini:\n    model: gemini-3\n")
-	if got := cfg.AgentConfig["acp:gemini"]; got.Model != "gemini-3" {
+	if got := cfg.AgentConfig["acp:gemini"].Base; got.Model != "gemini-3" {
 		t.Fatalf("AgentConfig[acp:gemini] = %#v", got)
 	}
 }
@@ -142,8 +142,8 @@ agent_args_override:
 
 func TestMerge_PreservesAgentConfig(t *testing.T) {
 	global := DefaultGlobalConfig()
-	global.AgentConfig = map[string]agentcfg.Profile{
-		"claude": {Model: "sonnet", Effort: agentcfg.EffortHigh},
+	global.AgentConfig = map[string]AgentTuning{
+		"claude": {Base: agentcfg.Profile{Model: "sonnet", Effort: agentcfg.EffortHigh}},
 	}
 	cfg := Merge(global, &RepoConfig{})
 	if got := cfg.AgentProfileFor(types.AgentClaude); got.Model != "sonnet" || got.Effort != agentcfg.EffortHigh {
@@ -158,7 +158,7 @@ func TestMerge_PreservesAgentConfig(t *testing.T) {
 func TestAgentProfileFollowsTheSelectedAgent(t *testing.T) {
 	cfg := &Config{
 		Agent:       types.AgentPi,
-		AgentConfig: map[string]agentcfg.Profile{"pi": {Effort: agentcfg.EffortMax}},
+		AgentConfig: map[string]AgentTuning{"pi": {Base: agentcfg.Profile{Effort: agentcfg.EffortMax}}},
 	}
 	if got := cfg.AgentProfile(); got.Effort != agentcfg.EffortMax {
 		t.Fatalf("AgentProfile() = %#v", got)

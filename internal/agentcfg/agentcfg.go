@@ -106,6 +106,20 @@ func (p Profile) String() string {
 	return strings.Join(parts, ",")
 }
 
+// OverrideWith layers a narrower profile on top of this one, field by field.
+// An unset field in the override leaves the base value standing, so a purpose
+// that only lowers effort keeps the agent's configured model rather than
+// silently clearing it.
+func (p Profile) OverrideWith(over Profile) Profile {
+	if over.Model != "" {
+		p.Model = over.Model
+	}
+	if over.Effort != "" {
+		p.Effort = over.Effort
+	}
+	return p
+}
+
 // Knob names one common field.
 type Knob string
 

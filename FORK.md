@@ -8,7 +8,7 @@ The fork exists for one reason: token consumption. Measured over 94 local runs (
 
 ## What diverges from upstream
 
-Both patches are additive and default to upstream behavior, so a fork build behaves exactly like the release it was built from until the new config is set.
+Every patch is additive and defaults to upstream behavior, so a fork build behaves exactly like the release it was built from until the new config is set.
 
 ### `max_rounds` - a total round budget per step
 
@@ -113,7 +113,21 @@ make build                       # then reinstall as above
 
 `skills/no-mistakes/SKILL.md` is generated from the `body` constant in `internal/skill/skill.go`. After resolving a conflict that touches either, run `make skill`; `make lint` fails on drift.
 
+### Model and effort per purpose
+
+`agent_config` was keyed by agent name only, so review, the review fixer, and the documentation pass all ran on one model at one effort. Those three duties are 63% of measured token spend here, which made a single global effort the only lever - and lowering it weakened the initial review, the pass that actually catches bugs.
+
+`agent_config.<agent>.purposes` narrows `model` and `effort` per duty, as a delta on that agent's base profile. It nests under the agent because a model name is harness-specific: with an ordered fallback list, one purpose-level model string cannot serve both harnesses.
+
+Two things made this more than a config change:
+
+- A profile becomes native argv when the adapter is constructed, so one instance runs one model at one effort. `agent.WithPurposeProfiles` builds one instance per narrowed purpose, lazily and cached for the run, and falls back to base when a build fails.
+- `RunOpts.Purpose` arrived **empty** at several call sites (ci, rebase, pr, test-evidence). Only the telemetry recorder defaulted it to the step name, far too late to route anything. That default moved into `perfRecordingAgent.Run`, before delegation, so the duty that dispatches is exactly the duty that is recorded.
+
+Config surface is documented in `docs/src/content/docs/reference/global-config.md` (`agent_config` -> `purposes`); the vocabulary lives in `internal/types/purpose.go`.
+
+Touches: `internal/types/purpose.go`, `internal/agent/purpose.go`, `internal/agentcfg/agentcfg.go`, `internal/config/config.go`, `internal/daemon/manager.go`, `internal/pipeline/instrument.go`.
+
 ## Deliberately not done
 
-- **Model and effort per purpose.** `RunOpts.Purpose` already reaches the adapters carrying `review`, `review-fix`, `test`, `housekeeping`, and is marked instrumentation-only there, while `agent_config` is keyed by agent name rather than by step - so review, the review fixer, and the documentation pass cannot be given different models or effort levels. Those three purposes are 63% of measured token spend, which makes this the larger remaining lever. Tracked upstream as issue #482.
 - **Contributing any of this upstream.** See the top of this file.

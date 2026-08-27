@@ -266,33 +266,49 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot stri
 	if len(agents) == 0 {
 		agents = []types.AgentName{cfg.Agent}
 	}
-	created := make([]agent.Agent, 0, len(agents))
-	for _, name := range agents {
-		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
-			ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
-			DisableProjectSettings: cfg.DisableProjectSettings,
-			Profile:                cfg.AgentProfileFor(name),
-			Environment:            environment,
-		})
-		if err != nil {
-			for _, existing := range created {
-				_ = existing.Close()
+
+	// buildChain assembles the whole fallback chain under one purpose. The
+	// empty purpose is the base chain, which is what every agent_config
+	// without purpose overrides produces - byte-identical to the pre-purpose
+	// construction, because AgentProfileForPurpose falls back to the base
+	// profile.
+	buildChain := func(purpose string) (agent.Agent, error) {
+		created := make([]agent.Agent, 0, len(agents))
+		for _, name := range agents {
+			next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
+				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
+				DisableProjectSettings: cfg.DisableProjectSettings,
+				Profile:                cfg.AgentProfileForPurpose(name, purpose),
+				Environment:            environment,
+			})
+			if err != nil {
+				for _, existing := range created {
+					_ = existing.Close()
+				}
+				return nil, fmt.Errorf("create agent %s: %w", name, err)
 			}
-			return nil, fmt.Errorf("create agent %s: %w", name, err)
+			created = append(created, agent.WithSteering(next, evidenceRoot))
 		}
-		created = append(created, agent.WithSteering(next, evidenceRoot))
-	}
-	ag := agent.NewFallback(created)
-	// Fail closed ONLY under the trusted opt-out (see startRun): refuse an
-	// unverified harness when the repo disabled project settings; otherwise run
-	// every adapter as before.
-	if cfg.DisableProjectSettings {
-		if err := agent.EnsureGateNeutralized(ag); err != nil {
-			_ = ag.Close()
-			return nil, err
+		chain := agent.NewFallback(created)
+		// Fail closed ONLY under the trusted opt-out (see startRun): refuse an
+		// unverified harness when the repo disabled project settings; otherwise
+		// run every adapter as before. Every purpose-built chain is checked,
+		// not just the base one, so the opt-out cannot be weakened by routing
+		// an invocation through a purpose.
+		if cfg.DisableProjectSettings {
+			if err := agent.EnsureGateNeutralized(chain); err != nil {
+				_ = chain.Close()
+				return nil, err
+			}
 		}
+		return chain, nil
 	}
-	return ag, nil
+
+	base, err := buildChain("")
+	if err != nil {
+		return nil, err
+	}
+	return agent.WithPurposeProfiles(base, cfg.NarrowedPurposes(), buildChain), nil
 }
 
 func forgeEnvironment(ctx *forgecontext.Context) runenv.Overlay {
