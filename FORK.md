@@ -45,7 +45,19 @@ Neither patch does anything until configured. The operator config that makes the
 max_rounds:
   review: 4
   test: 3
+
+# No base model or effort is pinned: review keeps the harness default, because
+# it is the pass that actually catches bugs. Only these duties are narrowed.
+agent_config:
+  claude:
+    purposes:
+      review-fix:
+        effort: medium
+      housekeeping:
+        effort: low
 ```
+
+The purpose choices come from the local telemetry, not from taste: `review-fix` is 32.5% of all tokens and `housekeeping` 12.8%, and neither judges the change - one applies findings a review round already prescribed, the other edits documentation. `review` itself is left alone. Read your own split with `no-mistakes stats` before copying these.
 
 ## Building and installing over the released binary
 
