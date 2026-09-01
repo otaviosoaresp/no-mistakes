@@ -227,8 +227,8 @@ Symptom: pipeline completes but the PR step shows `skipped`.
 
 Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requirements. Most common causes:
 
-- `gh`, `glab`, `forgejo-axi`, or `tea` not installed
-- The provider CLI reports that it is not authenticated
+- `gh`, `glab`, `forgejo-axi`, or `tea` not installed (or, for GitHub, not on `PATH`)
+- The provider CLI reports that it is not authenticated; on GitHub, a timed-out or interrupted `gh auth status` is reported separately from auth failure
 - Bitbucket env vars not set in the daemon's environment
 - Upstream is not one of the hosts listed in Provider Integration
 - Self-hosted GitHub Enterprise on a hostname that is not `github.com` isn't detected because `gh` isn't configured for the host; run `gh auth login --hostname your-ghe.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`gh auth status --hostname your-ghe.example.com`), so a stale token on `github.com` or any other configured gh host can no longer falsely mark the GHE repo as unauthenticated.
@@ -263,7 +263,7 @@ It does not cancel the step, fail the run, or mean the pipeline is safe to bypas
 
 A quiet Review step still ends on its own: its agent turns are bounded by [`review_agent_timeout`](/no-mistakes/reference/global-config/#review_agent_timeout), after which the run fails with a timeout diagnostic in the step log.
 A quiet Test step is bounded the same way by [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout), covering the post-test evidence-gathering agent and a Test-repair turn.
-Every other agent-spawning step (Document, Lint, Rebase conflict repair, PR drafting, CI auto-fix) is bounded by [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout), so a stall reaches the step's normal agent-error handling instead of remaining active until you abort. Those errors fail agent-driven mutation steps; PR drafting instead continues with its deterministic fallback content.
+Every other agent-spawning step (Document, Lint, Rebase conflict repair, PR drafting, CI auto-fix) is bounded by [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout), so a stall reaches the step's normal agent-error handling instead of remaining active until you abort. Most mutation steps fail, PR drafting continues with deterministic fallback content, and CI auto-fix parks for a user decision as described in the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci).
 
 Start by reading the active run and the step log:
 

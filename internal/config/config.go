@@ -58,6 +58,13 @@ const (
 	DefaultDaemonConnectTimeout = 3 * time.Second
 	// DefaultBranchSyncRemoteTimeout bounds each remote Git operation (ls-remote, fetch) in internal/branchsync. Global-config-only; a pushed branch cannot change it. Timeout still fails closed.
 	DefaultBranchSyncRemoteTimeout = 60 * time.Second
+	// DefaultGateReconcileInterval is how often a parked approval gate is
+	// rechecked. Global-config-only; a pushed branch cannot change it.
+	DefaultGateReconcileInterval = 2 * time.Minute
+	// DefaultGateReconcileTimeout is the deadline for one approval-gate
+	// reconciliation check (including host.Available / gh auth status).
+	// Global-config-only; a pushed branch cannot change it.
+	DefaultGateReconcileTimeout = 30 * time.Second
 	// CITimeoutUnlimited is the sentinel meaning "monitor until the PR is
 	// merged, closed, or the run is aborted - never self-terminate".
 	// Any non-positive ci_timeout, or the keywords "unlimited", "none",
@@ -76,6 +83,20 @@ const (
 	// with an agent round, but they are not free: each one keeps the monitor
 	// polling the same commit, so the budget stays small by construction.
 	MaxCIRerunTransient = 5
+	// DefaultCIRevalidateRepairs is the policy the CI step uses when
+	// ci.revalidate_repairs is unset. It is false because restarting the whole
+	// pipeline at Review for every CI repair is the single most expensive
+	// thing the pipeline can do to a run: it replays Review, Test, Document,
+	// Lint, Push, and PR against the repaired head, so one repair costs
+	// another full agent pass over the whole change. VISION.md's cost
+	// constraint makes that opt-in.
+	//
+	// False does not mean "always publish". It means "publish when it is
+	// provably safe to": a repair is published only when its head is the run's
+	// review-approved commit or a descendant of it, and any repair that cannot
+	// show that - every merge-conflict repair, since a rebase rewrites the
+	// head - revalidates from Review instead. See CI.RevalidateRepairs.
+	DefaultCIRevalidateRepairs = false
 	// DefaultEvalMaxCases caps the auto-captured local eval corpus. Cases
 	// share one object pool per repository, so the marginal cost of a case is
 	// its JSON records plus the objects its commits actually introduced, not a
@@ -133,7 +154,13 @@ type GlobalConfig struct {
 	TestAgentTimeout        time.Duration     `yaml:"-"`
 	DaemonConnectTimeout    time.Duration     `yaml:"-"`
 	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
-	LogLevel                string            `yaml:"log_level"`
+	// GateReconcileInterval / GateReconcileTimeout bound how often and how
+	// long a parked approval gate is rechecked. They are machine-local
+	// operator knobs (slow hosts, contended gh auth) and global-only so a
+	// pushed branch cannot widen or shrink the reconcile budget.
+	GateReconcileInterval time.Duration `yaml:"-"`
+	GateReconcileTimeout  time.Duration `yaml:"-"`
+	LogLevel              string        `yaml:"log_level"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
 	// one durable fixer session across review-fix turns. Review turns always
 	// run session-free so the rereview never resumes the session whose
@@ -171,6 +198,8 @@ type globalConfigRaw struct {
 	CITimeout               string                     `yaml:"ci_timeout"`
 	DaemonConnectTimeout    string                     `yaml:"daemon_connect_timeout"`
 	BranchSyncRemoteTimeout string                     `yaml:"branch_sync_remote_timeout"`
+	GateReconcileInterval   string                     `yaml:"gate_reconcile_interval"`
+	GateReconcileTimeout    string                     `yaml:"gate_reconcile_timeout"`
 	BabysitTimeout          string                     `yaml:"babysit_timeout"`
 	StepQuietWarning        string                     `yaml:"step_quiet_warning"`
 	AgentTimeout            string                     `yaml:"agent_timeout"`
@@ -494,6 +523,10 @@ type MaxRounds struct {
 // Pointer fields distinguish "not set" (nil) from "set to 0" (disabled).
 type CIRaw struct {
 	RerunTransient *int `yaml:"rerun_transient"`
+	// RevalidateRepairs is a pointer so an explicit `false` in a repository's
+	// config can override a global `true`, which a plain bool could not
+	// express (it would be indistinguishable from "not set").
+	RevalidateRepairs *bool `yaml:"revalidate_repairs"`
 }
 
 // CI holds the resolved CI-step settings.
@@ -504,6 +537,33 @@ type CI struct {
 	// an approval gate. 0 disables reruns and restores the behavior of
 	// escalating every failure on sight.
 	RerunTransient int
+	// RevalidateRepairs selects what happens after the CI step's fix agent
+	// produces a real repair commit.
+	//
+	// One rule decides delivery on every CI-fix path, automatic and manual, CI
+	// failure and merge conflict alike: a repair is published without
+	// revalidating only when its continuity with the reviewed, published head
+	// can be PROVEN - the repaired head is the run's review-approved commit or
+	// a descendant of it - and revalidates from Review when it cannot.
+	//
+	// false (default): a provable repair is published through the same guarded
+	// force-push path the Push step uses - review-approved-head continuity, the
+	// force-with-lease anchor, remote verification, the gate mirror, and the
+	// push binding all still apply, and none of it is recorded until all of it
+	// succeeds - and the CI monitor keeps watching the same run for the new
+	// head. The run's review approval stays valid because the repair descends
+	// from the approved head. A repair whose continuity cannot be proven takes
+	// the revalidating path below instead; a merge-conflict repair always does,
+	// because a rebase makes its head a non-descendant and resolving a conflict
+	// changes the commit's patch-id, so no content-based guard can tell a
+	// resolved rebase from one that dropped the work.
+	//
+	// true: the repair is kept local, the run's review approval is revoked,
+	// and the pipeline restarts at Review so the repaired head re-passes
+	// Review, Test, Document, and Lint before Push republishes it. Safer, and
+	// materially more expensive in wall-clock time and tokens - which is why
+	// it is opt-in (see VISION.md).
+	RevalidateRepairs bool
 }
 
 // AutoFix holds resolved per-step auto-fix attempt limits.
@@ -536,6 +596,8 @@ type Config struct {
 	AgentTimeout          time.Duration
 	ReviewAgentTimeout    time.Duration
 	TestAgentTimeout      time.Duration
+	GateReconcileInterval time.Duration
+	GateReconcileTimeout  time.Duration
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
@@ -820,6 +882,13 @@ daemon_connect_timeout: "3s"
 # (ls-remote or fetch) before treating the target as offline. Global-only.
 branch_sync_remote_timeout: "60s"
 
+# How often a parked approval gate is rechecked, and the deadline for each
+# check (including gh auth status). Raise gate_reconcile_timeout on a slow or
+# contended machine so a transient auth-status delay is not cancelled mid-call.
+# Global-only.
+gate_reconcile_interval: "2m"
+gate_reconcile_timeout: "30s"
+
 # Reuse one durable fixer session per run across review-fix turns. Review turns
 # always run session-free so a rereview never resumes the session that prescribed
 # its fixes. Supported for claude, codex, grok, and pi; other agents run cold.
@@ -934,6 +1003,18 @@ max_rounds:
 # default branch overrides this value.
 ci:
   rerun_transient: 0
+  # Whether EVERY CI repair must re-pass the whole pipeline before it is
+  # published, or only the ones whose continuity with the reviewed head cannot
+  # be proven. Defaults to false: a repair that descends from the reviewed head
+  # is published through the same guarded force-push path the Push step uses and
+  # CI keeps monitoring, so one repair costs one agent round. A repair that
+  # cannot show that ancestry revalidates from Review anyway - a merge-conflict
+  # repair always does, because rebasing rewrites the head. Set true to restart
+  # validation at Review for every repair - safer, and it pays for another full
+  # pipeline pass in wall clock and tokens every time CI is repaired. A
+  # repository that sets ci.revalidate_repairs on its own default branch
+  # overrides this value.
+  revalidate_repairs: false
 
 # Auto-fix commit subject template. Available variables: {{.Step}} and {{.Summary}}.
 # Repo config may override this value.
@@ -1746,6 +1827,8 @@ func DefaultGlobalConfig() *GlobalConfig {
 		TestAgentTimeout:        DefaultTestAgentTimeout,
 		DaemonConnectTimeout:    DefaultDaemonConnectTimeout,
 		BranchSyncRemoteTimeout: DefaultBranchSyncRemoteTimeout,
+		GateReconcileInterval:   DefaultGateReconcileInterval,
+		GateReconcileTimeout:    DefaultGateReconcileTimeout,
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
@@ -2008,6 +2091,20 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 			return nil, err
 		}
 		cfg.BranchSyncRemoteTimeout = d
+	}
+	if raw.GateReconcileInterval != "" {
+		d, err := parsePositiveDuration("gate_reconcile_interval", raw.GateReconcileInterval)
+		if err != nil {
+			return nil, err
+		}
+		cfg.GateReconcileInterval = d
+	}
+	if raw.GateReconcileTimeout != "" {
+		d, err := parsePositiveDuration("gate_reconcile_timeout", raw.GateReconcileTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.GateReconcileTimeout = d
 	}
 	if raw.LogLevel != "" {
 		cfg.LogLevel = raw.LogLevel
@@ -2302,10 +2399,14 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// default-branch copy so a pushed branch cannot self-declare no-CI and
 		// bypass checks that the default branch still expects.
 		effective.NoCI = trusted.NoCI
-		// ci.rerun_transient spends the maintainer's resources rather than the
-		// contributor's: every rerun is another provider-side workflow run
-		// billed to the repository. It is trusted-only for that reason, so a
-		// pushed branch cannot raise its own rerun budget to the cap.
+		// The whole ci block is trusted-only. ci.rerun_transient spends the
+		// maintainer's resources rather than the contributor's: every rerun is
+		// another provider-side workflow run billed to the repository, so a
+		// pushed branch must not be able to raise its own rerun budget to the
+		// cap. ci.revalidate_repairs is a validation boundary in the same
+		// sense: it decides whether a CI repair commit must re-pass Review
+		// before it is published, so a pushed branch must not be able to turn
+		// the maintainer's revalidation requirement off for its own repairs.
 		effective.CI = trusted.CI
 		// test.evidence.branch names the git ref evidence commits are pushed
 		// to with the maintainer's credentials. It is trusted-only so a pushed
@@ -2617,8 +2718,14 @@ func (c *Config) MaxRoundsLimit(step types.StepName) int {
 // safe baseline is to escalate rather than risk restarting a job a maintainer
 // or a concurrency rule deliberately stopped. Repositories that know their
 // cancellations are provider-side opt in via ci.rerun_transient.
+// Post-repair revalidation is off for the reason recorded on
+// DefaultCIRevalidateRepairs: it is the pipeline's most expensive single
+// behavior, so it is opted into rather than paid for by default.
 func ciDefaults() CI {
-	return CI{RerunTransient: DefaultCIRerunTransient}
+	return CI{
+		RerunTransient:    DefaultCIRerunTransient,
+		RevalidateRepairs: DefaultCIRevalidateRepairs,
+	}
 }
 
 // applyCIOverrides applies non-nil raw values onto resolved defaults, clamping
@@ -2626,10 +2733,16 @@ func ciDefaults() CI {
 // inverting the bound, and anything above MaxCIRerunTransient is capped so a
 // typo cannot keep a run polling one commit indefinitely.
 func applyCIOverrides(dst *CI, src *CIRaw) {
-	if src.RerunTransient == nil {
-		return
+	if src.RerunTransient != nil {
+		dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
 	}
-	dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
+	// Applied independently of the rerun budget so a config that sets only one
+	// of the two keys does not silently discard the other, and so an explicit
+	// `revalidate_repairs: false` in the later (repository) source overrides an
+	// earlier `true` rather than reading as "unset".
+	if src.RevalidateRepairs != nil {
+		dst.RevalidateRepairs = *src.RevalidateRepairs
+	}
 }
 
 // applyAutoFixOverrides applies non-nil raw values onto resolved defaults.
@@ -2716,21 +2829,23 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	}
 
 	cfg := &Config{
-		Agent:                global.Agent,
-		Agents:               copyAgents(global.Agents),
-		ACPXPath:             global.ACPXPath,
-		ForgejoAXIPath:       global.ForgejoAXIPath,
-		ACPRegistryOverrides: global.ACPRegistryOverrides,
-		AgentPathOverride:    global.AgentPathOverride,
-		AgentArgsOverride:    global.AgentArgsOverride,
-		AgentConfig:          global.AgentConfig,
-		CITimeout:            global.CITimeout,
-		StepQuietWarning:     global.StepQuietWarning,
-		AgentTimeout:         global.AgentTimeout,
-		ReviewAgentTimeout:   global.ReviewAgentTimeout,
-		TestAgentTimeout:     global.TestAgentTimeout,
-		LogLevel:             global.LogLevel,
-		SessionReuse:         global.SessionReuse,
+		Agent:                 global.Agent,
+		Agents:                copyAgents(global.Agents),
+		ACPXPath:              global.ACPXPath,
+		ForgejoAXIPath:        global.ForgejoAXIPath,
+		ACPRegistryOverrides:  global.ACPRegistryOverrides,
+		AgentPathOverride:     global.AgentPathOverride,
+		AgentArgsOverride:     global.AgentArgsOverride,
+		AgentConfig:           global.AgentConfig,
+		CITimeout:             global.CITimeout,
+		StepQuietWarning:      global.StepQuietWarning,
+		AgentTimeout:          global.AgentTimeout,
+		ReviewAgentTimeout:    global.ReviewAgentTimeout,
+		TestAgentTimeout:      global.TestAgentTimeout,
+		GateReconcileInterval: global.GateReconcileInterval,
+		GateReconcileTimeout:  global.GateReconcileTimeout,
+		LogLevel:              global.LogLevel,
+		SessionReuse:          global.SessionReuse,
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,

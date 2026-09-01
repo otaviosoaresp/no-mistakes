@@ -157,12 +157,12 @@ func TestExecutor_MaxRoundsUnlimitedByDefault(t *testing.T) {
 	// on the previous round's gate and race ahead of the new one.
 	waitForCallCount(t, &callCount, 1)
 	for round := 2; round <= 4; round++ {
-		exec.Respond(types.StepReview, types.ActionFix, []string{"r1"})
+		respondWhenReady(t, exec, types.ActionFix)
 		waitForCallCount(t, &callCount, int64(round))
 	}
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
 
-	exec.Respond(types.StepReview, types.ActionApprove, nil)
+	respondWhenReady(t, exec, types.ActionApprove)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -267,4 +267,20 @@ func waitForCallCount(t *testing.T, count *atomic.Int64, want int64) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("step executed %d times, want %d", count.Load(), want)
+}
+
+// respondWhenReady closes the small handoff between a step call returning and
+// the executor publishing its next approval slot. The production API correctly
+// rejects a response before that slot exists; this helper waits for that
+// documented readiness instead of making the test depend on goroutine timing.
+func respondWhenReady(t *testing.T, exec *Executor, action types.ApprovalAction) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Respond(types.StepReview, action, []string{"r1"}); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("executor did not publish an approval slot")
 }

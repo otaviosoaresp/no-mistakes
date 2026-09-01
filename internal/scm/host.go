@@ -144,10 +144,18 @@ const (
 	CheckBucketSkip    CheckBucket = "skipping"
 )
 
+type CheckKind string
+
+const (
+	CheckKindRun    CheckKind = "run"
+	CheckKindStatus CheckKind = "status"
+)
+
 // Check is a single CI check result on a PR.
 type Check struct {
 	Name   string
 	Bucket CheckBucket
+	Kind   CheckKind
 	// State is the provider's own outcome string for the check (GitHub
 	// conclusions such as FAILURE, TIMED_OUT, CANCELLED). Buckets collapse
 	// several outcomes into one value, so callers that must tell an
@@ -155,6 +163,15 @@ type Check struct {
 	// provider reported no state.
 	State       string
 	CompletedAt time.Time // zero when unknown; used to detect CI re-runs between polls
+	// StartedAt is when this specific check run began. It is the ordering key
+	// backends use to collapse superseded same-name check runs (e.g. a raw
+	// commit rollup that keeps every run a commit ever had) down to the
+	// latest one; zero when the provider did not report it.
+	StartedAt time.Time
+	// WorkflowID identifies the provider workflow that emitted the check. It
+	// distinguishes independent same-name workflows while allowing reruns of
+	// one workflow to use latest-wins ordering. Zero when unavailable.
+	WorkflowID int64
 	// Link is the provider's details URL for this check. It may identify an
 	// individual job or a provider-side workflow run for targeted reruns. Empty
 	// when the provider reported no link.
@@ -181,6 +198,7 @@ type Capabilities struct {
 	MergeableState  bool
 	FailedCheckLogs bool
 	MergedProof     bool
+	ReviewComments  bool
 }
 
 var (
@@ -193,6 +211,31 @@ var (
 	// the wrong commit.
 	ErrHeadChanged = errors.New("pull request head changed")
 )
+
+// ReviewComment represents a code review comment or bot finding on a pull request.
+type ReviewComment struct {
+	ID        string
+	Author    string
+	Path      string
+	Line      int
+	Body      string
+	CreatedAt time.Time
+	URL       string
+}
+
+// ReviewCommentsHost is an optional interface for SCM hosts that support fetching
+// unresolved review comments on a pull request.
+type ReviewCommentsHost interface {
+	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
+}
+
+// PRContentReader is an optional interface for hosts that can read the current
+// title and body of an existing PR. The CI repair publisher uses it to rebind
+// a live pipeline attestation to a newly published head without rewriting the
+// rest of the body or inventing an attestation that was not already there.
+type PRContentReader interface {
+	GetPRContent(ctx context.Context, pr *PR) (PRContent, error)
+}
 
 // MergedProof is provider evidence that a specific PR head was merged.
 type MergedProof struct {

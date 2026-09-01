@@ -31,8 +31,8 @@ import (
 type EventFunc func(ipc.Event)
 
 const (
-	defaultGateReconcileInterval = 2 * time.Minute
-	defaultGateReconcileTimeout  = 30 * time.Second
+	defaultGateReconcileInterval = config.DefaultGateReconcileInterval
+	defaultGateReconcileTimeout  = config.DefaultGateReconcileTimeout
 )
 
 type approvalResponse struct {
@@ -102,7 +102,7 @@ func NewExecutor(database *db.DB, p *paths.Paths, cfg *config.Config, ag agent.A
 	if onEvent == nil {
 		onEvent = func(ipc.Event) {}
 	}
-	return &Executor{
+	exec := &Executor{
 		db:                    database,
 		paths:                 p,
 		config:                cfg,
@@ -113,6 +113,12 @@ func NewExecutor(database *db.DB, p *paths.Paths, cfg *config.Config, ag agent.A
 		gateReconcileInterval: defaultGateReconcileInterval,
 		gateReconcileTimeout:  defaultGateReconcileTimeout,
 	}
+	if cfg != nil {
+		// Global config is the production path for these timings; SetGate*
+		// remains for tests and specialized embeddings.
+		exec.SetGateReconcileTimings(cfg.GateReconcileInterval, cfg.GateReconcileTimeout)
+	}
+	return exec
 }
 
 // runEvidenceDir resolves where this run's test evidence is written. The
@@ -382,6 +388,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		Run:          run,
 		Repo:         repo,
 		WorkDir:      workDir,
+		GateDir:      e.paths.RepoDir(repo.ID),
 		Config:       e.config,
 		ForgeContext: e.forge,
 		DB:           e.db,
@@ -775,6 +782,15 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			if dbErr := e.db.SetStepAgentActivity(sr.ID, text, nil); dbErr != nil {
 				slog.Warn("failed to set step agent activity in db", "step", stepName, "error", dbErr)
 			}
+		case agent.LifecyclePhaseActivity:
+			// Subprocess liveness, not narrative: record that the agent is still
+			// producing bytes so `axi status` can distinguish a working fix round
+			// from a wedged one, but never write it to the step log. A long turn
+			// emits these every few seconds and the log is what an operator reads.
+			if dbErr := e.db.TouchStepActivity(sr.ID, text); dbErr != nil {
+				slog.Warn("failed to touch step activity in db", "step", stepName, "error", dbErr)
+			}
+			return
 		default:
 			if dbErr := e.db.TouchStepActivity(sr.ID, text); dbErr != nil {
 				slog.Warn("failed to touch step activity in db", "step", stepName, "error", dbErr)
@@ -833,6 +849,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Run:              run,
 		Repo:             repo,
 		WorkDir:          workDir,
+		GateDir:          e.paths.RepoDir(repo.ID),
 		Agent:            stepAgent,
 		Config:           e.config,
 		ForgeContext:     e.forge,
