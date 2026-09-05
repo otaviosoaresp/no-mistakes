@@ -27,6 +27,14 @@ type StepResult struct {
 	AutoFixLimit   *int
 	MaxRounds      *int
 	CIFixAttempts  int
+	// OverrideReason is non-nil exactly when a human answered ActionApprove on
+	// this step's gate despite an unresolved external condition (currently:
+	// the CI step's live checks were still failing). See
+	// pipeline.ApprovalOverrideVerifier and Executor's two ActionApprove sites.
+	OverrideReason *string
+	// SkipReason records an automatic PR/CI skip, distinct from an explicit
+	// per-run skip. Legacy rows have no recorded reason.
+	SkipReason *string
 }
 
 const stepResultColumns = `id, run_id, step_name, step_order, status, exit_code, duration_ms, log_path, findings_json, error, started_at, completed_at, last_activity_at, last_activity, agent_pid, auto_fix_limit`
@@ -36,18 +44,28 @@ const stepResultColumns = `id, run_id, step_name, step_order, status, exit_code,
 // database before migrations run, and naming a missing column there fails the
 // query outright, which would block every pipeline-control command.
 func (d *DB) readableStepResultColumns() string {
-	cols := stepResultColumns
+	columns := stepResultColumns
 	if d.hasColumn("step_results", "max_rounds") {
-		cols += ", max_rounds"
+		columns += ", max_rounds"
 	} else {
-		cols += ", NULL AS max_rounds"
+		columns += ", NULL AS max_rounds"
 	}
 	if d.hasColumn("step_results", "ci_fix_attempts") {
-		cols += ", ci_fix_attempts"
+		columns += ", ci_fix_attempts"
 	} else {
-		cols += ", 0 AS ci_fix_attempts"
+		columns += ", 0 AS ci_fix_attempts"
 	}
-	return cols
+	if d.hasColumn("step_results", "override_reason") {
+		columns += ", override_reason"
+	} else {
+		columns += ", NULL AS override_reason"
+	}
+	if d.hasColumn("step_results", "skip_reason") {
+		columns += ", skip_reason"
+	} else {
+		columns += ", NULL AS skip_reason"
+	}
+	return columns
 }
 
 // InsertStepResult creates a new step result record.
@@ -74,7 +92,7 @@ func (d *DB) GetStepResult(id string) (*StepResult, error) {
 	s := &StepResult{}
 	err := d.sql.QueryRow(
 		`SELECT `+d.readableStepResultColumns()+` FROM step_results WHERE id = ?`, id,
-	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts)
+	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts, &s.OverrideReason, &s.SkipReason)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -96,7 +114,7 @@ func (d *DB) GetStepsByRun(runID string) ([]*StepResult, error) {
 	var steps []*StepResult
 	for rows.Next() {
 		s := &StepResult{}
-		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts); err != nil {
+		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.MaxRounds, &s.CIFixAttempts, &s.OverrideReason, &s.SkipReason); err != nil {
 			return nil, fmt.Errorf("scan step result: %w", err)
 		}
 		steps = append(steps, s)
@@ -209,6 +227,23 @@ func (d *DB) SetCIFixAttempts(id string, attempts int) error {
 	return nil
 }
 
+// SetStepOverrideReason records that a human answered ActionApprove on this
+// step's gate despite an unresolved external condition (see
+// pipeline.ApprovalOverrideVerifier). Called alongside, not instead of, the
+// normal step-completion write: it never changes Status, only annotates why
+// the completion happened without the condition that raised the gate having
+// cleared. reason must be non-empty; the column stays NULL for every
+// ordinarily-resolved step, which is what marks a run "verified green".
+func (d *DB) SetStepOverrideReason(id string, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("set step override reason: reason must not be empty")
+	}
+	if _, err := d.sql.Exec(`UPDATE step_results SET override_reason = ? WHERE id = ?`, reason, id); err != nil {
+		return fmt.Errorf("set step override reason: %w", err)
+	}
+	return nil
+}
+
 // stepLimitDBValue stores a non-positive limit as NULL, so "unlimited" reads
 // back the same way for rows written before the column existed.
 func stepLimitDBValue(limit int) any {
@@ -225,9 +260,18 @@ func (d *DB) CompleteStep(id string, exitCode int, durationMS int64, logPath str
 
 // CompleteStepWithStatus marks a step as finished with timing and result info.
 func (d *DB) CompleteStepWithStatus(id string, status types.StepStatus, exitCode int, durationMS int64, logPath string) error {
+	return d.completeStep(id, status, exitCode, durationMS, logPath, "")
+}
+
+// CompleteSkippedStep atomically preserves the automatic skip cause with its status.
+func (d *DB) CompleteSkippedStep(id string, exitCode int, durationMS int64, logPath, reason string) error {
+	return d.completeStep(id, types.StepStatusSkipped, exitCode, durationMS, logPath, reason)
+}
+
+func (d *DB) completeStep(id string, status types.StepStatus, exitCode int, durationMS int64, logPath, skipReason string) error {
 	_, err := d.sql.Exec(
-		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL WHERE id = ?`,
-		status, exitCode, durationMS, logPath, now(), now(), fmt.Sprintf("status: %s", status), id,
+		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, skip_reason = NULLIF(?, '') WHERE id = ?`,
+		status, exitCode, durationMS, logPath, now(), now(), fmt.Sprintf("status: %s", status), skipReason, id,
 	)
 	if err != nil {
 		return fmt.Errorf("complete step: %w", err)

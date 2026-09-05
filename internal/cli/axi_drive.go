@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	toon "github.com/toon-format/toon-go"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
@@ -54,22 +58,41 @@ func outcomeFor(status string) string {
 	}
 }
 
+// outcomeForRun qualifies completed runs whose external checks were overridden
+// or whose publication/verification automatically skipped. Explicit per-run
+// skips carry no automatic cause and retain their existing outcome.
+func outcomeForRun(rv runView) string {
+	word := outcomeFor(rv.Status)
+	if word == "passed" && rv.CIOverrideReason != "" {
+		return "passed-with-override"
+	}
+	if word == "passed" && len(rv.automaticSkips()) > 0 {
+		return "passed-with-skips"
+	}
+	return word
+}
+
 func newAxiRunCmd() *cobra.Command {
 	var autoYes bool
 	var skipValue string
 	var intent string
+	var baseBranch string
 
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Validate your code changes, blocking until a decision point or the outcome",
 		Long: "Triggers a pipeline run for the current branch and drives it. Without\n" +
 			"--yes it blocks until the first approval gate, CI-ready point, or final outcome and\n" +
-			"prints it. With --yes it auto-resolves every gate (fixing actionable\n" +
+			"prints it. With --yes it auto-resolves eligible gates (fixing actionable\n" +
 			"findings - including ask-user findings, with no escalation - then\n" +
-			"accepting the result) until a decision point or outcome.\n\n" +
+			"accepting the result) until a decision point or outcome.\n" +
+			"Protected-path refusals require an explicit response, even with --yes.\n\n" +
 			"--intent is required when starting a new run: pass what the user set out\n" +
 			"to accomplish (the goal behind the change, not a description of the diff)\n" +
 			"so no-mistakes uses it directly instead of inferring it from transcripts.\n\n" +
+			"--base-branch targets an integration branch other than the repository default\n" +
+			"for this run only (for example an epic branch). It overrides pr.base_branch\n" +
+			"in repo config and is persisted on the run for rebase, PR, and CI steps.\n\n" +
 			"The calling agent drives AXI approval gates but does not become the pipeline\n" +
 			"agent. The daemon requires a supported native agent binary, the `agent: cursor`\n" +
 			"ACP alias, or an explicit `acp:<target>` through `acpx`, and fails before the\n" +
@@ -80,26 +103,28 @@ func newAxiRunCmd() *cobra.Command {
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return trackAxiSurface("axi-run", "/axi/run", telemetry.Fields{
-				"auto_yes":   autoYes,
-				"has_intent": strings.TrimSpace(intent) != "",
-				"has_skip":   strings.TrimSpace(skipValue) != "",
+				"auto_yes":        autoYes,
+				"has_intent":      strings.TrimSpace(intent) != "",
+				"has_skip":        strings.TrimSpace(skipValue) != "",
+				"has_base_branch": strings.TrimSpace(baseBranch) != "",
 			}, func() error {
 				skipSteps, err := parseSkipSteps(skipValue)
 				if err != nil {
 					return emitError(cmd, 2, err.Error(),
 						"Valid steps: intent, rebase, review, test, document, lint, push, pr, ci")
 				}
-				return runAxiRun(cmd, autoYes, skipSteps, intent)
+				return runAxiRun(cmd, autoYes, skipSteps, intent, baseBranch)
 			})
 		},
 	}
-	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve every gate (fix findings, then accept) until a decision point or outcome")
+	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve eligible gates (fix findings, then accept) until a decision point or outcome; protected-path refusals require an explicit response")
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip")
 	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish (not a description of the diff); used instead of inferring from transcripts (required to start a run)")
+	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
 	return cmd
 }
 
-func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent string) error {
+func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch string) error {
 	ctx := cmd.Context()
 	env, err := openAxiRunEnv()
 	if err != nil {
@@ -121,7 +146,20 @@ func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, int
 		return emitError(cmd, 1, fmt.Sprintf("get current HEAD: %v", err))
 	}
 
-	runID := activeRunID(env, branch, headSHA)
+	if strings.TrimSpace(baseBranch) != "" {
+		if _, err := steps.ValidateRunPRBaseBranchName(baseBranch); err != nil {
+			return emitError(cmd, 2, fmt.Sprintf("--base-branch: %v", err))
+		}
+	}
+
+	runID := ""
+	if active := activeRunInfo(env, branch, headSHA); active != nil {
+		if err := conflictingActiveRunPRBaseBranch(active, baseBranch); err != nil {
+			return emitError(cmd, 2, err.Error(),
+				"Omit --base-branch to reattach, or abort the active run before starting a new one")
+		}
+		runID = active.ID
+	}
 	if runID == "" {
 		if err := configErrorForFreshAxiRun(env, runID); err != nil {
 			return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
@@ -133,6 +171,9 @@ func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, int
 			return emitError(cmd, 2, "--intent is required to start a run",
 				`Pass what the user set out to accomplish: no-mistakes axi run --intent "the user's goal"`)
 		}
+		if err := validateAxiRunBaseBranch(ctx, baseBranch); err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
 		// Starting a fresh run: apply the same pre-flight the human wizard
 		// enforces, but as structured errors the agent acts on rather than
 		// silent auto-branching/auto-committing. The gate validates committed
@@ -142,7 +183,7 @@ func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, int
 			return guard(cmd)
 		}
 		var err error
-		runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent)
+		runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch)
 		if err != nil {
 			if ownershipErr, ok := err.(*branchOwnershipError); ok {
 				return emitBranchOwnershipError(cmd, ownershipErr)
@@ -165,13 +206,53 @@ func configErrorForFreshAxiRun(env *axiEnv, runID string) error {
 	return env.globalConfigErr
 }
 
+func validateAxiRunBaseBranch(ctx context.Context, baseBranch string) error {
+	normalized, err := steps.ValidateRunPRBaseBranchName(baseBranch)
+	if err != nil {
+		return fmt.Errorf("--base-branch: %w", err)
+	}
+	if normalized == "" {
+		return nil
+	}
+	return steps.VerifyRemoteBranchExists(ctx, ".", normalized)
+}
+
+// conflictingActiveRunPRBaseBranch reports when --base-branch would be
+// discarded by reattaching to an in-flight run that already has a different
+// (or empty) per-run PR target.
+func conflictingActiveRunPRBaseBranch(run *ipc.RunInfo, requested string) error {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || run == nil {
+		return nil
+	}
+	stored := ""
+	if run.PRBaseBranch != nil {
+		stored = strings.TrimSpace(*run.PRBaseBranch)
+	}
+	if stored == requested {
+		return nil
+	}
+	if stored == "" {
+		return fmt.Errorf("active run %s is already in progress without --base-branch %s", run.ID, requested)
+	}
+	return fmt.Errorf("active run %s is already targeting %s, not %s", run.ID, stored, requested)
+}
+
 // activeRunID returns the ID of a non-terminal run for branch and head, or "" if none.
 func activeRunID(env *axiEnv, branch, headSHA string) string {
-	var active ipc.GetActiveRunResult
-	if err := env.client.Call(ipc.MethodGetActiveRun, activeRunLookupParams(env.repo.ID, branch), &active); err != nil {
+	run := activeRunInfo(env, branch, headSHA)
+	if run == nil {
 		return ""
 	}
-	return activeRunIDForHead(&active, headSHA)
+	return run.ID
+}
+
+func activeRunInfo(env *axiEnv, branch, headSHA string) *ipc.RunInfo {
+	var active ipc.GetActiveRunResult
+	if err := env.client.Call(ipc.MethodGetActiveRun, activeRunLookupParams(env.repo.ID, branch), &active); err != nil {
+		return nil
+	}
+	return activeRunInfoForHead(active.Run, headSHA)
 }
 
 func activeRunIDForHead(active *ipc.GetActiveRunResult, headSHA string) string {
@@ -213,13 +294,46 @@ func preflightGuard(ctx context.Context, env *axiEnv, branch string) func(*cobra
 		}
 	}
 	if dirty {
+		help := []string{
+			"Commit the files that belong to this change (`git add <path> && git commit`), or gitignore / add the rest to `.git/info/exclude`",
+			"Run `git status` to see what is uncommitted",
+		}
+		if untracked, err := git.UntrackedFiles(ctx, "."); err == nil && len(untracked) > 0 {
+			help = append([]string{untrackedHint(untracked)}, help...)
+		}
 		return func(cmd *cobra.Command) error {
-			return emitError(cmd, 1, "uncommitted changes in the working tree",
-				"Commit your work before validating: `git add -A && git commit -m \"...\"`, then re-run",
-				"Run `git status` to see what is uncommitted")
+			return emitError(cmd, 1, "uncommitted changes in the working tree", help...)
 		}
 	}
 	return nil
+}
+
+// untrackedHint renders the untracked paths named in the dirty-worktree error,
+// bounded so a large untracked tree cannot bloat the error document. Paths stay
+// in git's order and the hint states how many were left out.
+func untrackedHint(untracked []string) string {
+	const maxUntrackedPaths = 5
+	const sep = ", "
+	shown := untracked
+	if len(shown) > maxUntrackedPaths {
+		shown = shown[:maxUntrackedPaths]
+	}
+	renderedPaths := make([]string, len(shown))
+	for i, path := range shown {
+		renderedPaths[i] = displayUntrackedPath(path)
+	}
+	rendered := strings.Join(renderedPaths, sep)
+	if dropped := len(untracked) - len(shown); dropped > 0 {
+		rendered += fmt.Sprintf("%s(+%d more)", sep, dropped)
+	}
+	return fmt.Sprintf("Untracked files (not in git yet): %s", rendered)
+}
+
+func displayUntrackedPath(path string) string {
+	if strings.TrimSpace(path) != path || strings.IndexFunc(path, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
+		return strconv.QuoteToGraphic(path)
+	}
+	return path
 }
 
 // branchOwnershipError carries the shared branch-sync classification that
@@ -289,9 +403,12 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent string) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch string) (string, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	if opt := formatIntentPushOption(intent); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	priorRunIDs, err := runIDsForHead(env.client, env.repo.ID, branch, headSHA)
@@ -320,10 +437,15 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 		return "", fmt.Errorf("push %q to gate: %v", branch, pushErr)
 	}
 
-	// No run appeared: the push was likely up-to-date. Rerun the latest gate
-	// head so `axi run` is still useful when there are no new commits.
+	// No run appeared: the push was likely up-to-date. Refresh the caller's
+	// clean-head evidence because it may have changed while waiting above.
 	var rr ipc.RerunResult
-	if err := env.client.Call(ipc.MethodRerun, rerunParams(env.repo.ID, branch, skipSteps, intent), &rr); err != nil {
+	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
+	params.CallerHeadSHA, err = rerunCallerHead(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := env.client.Call(ipc.MethodRerun, params, &rr); err != nil {
 		return "", fmt.Errorf("no run started for %q: %v", branch, err)
 	}
 	return rr.RunID, nil
@@ -407,8 +529,8 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent}
+func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch string) *ipc.RerunParams {
+	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch}
 }
 
 // driveRun subscribes to a run and reconciles authoritative state on transition
@@ -421,7 +543,8 @@ func rerunParams(repoID, branch string, skipSteps []types.StepName, intent strin
 // findings is fixed (every finding selected), and the resulting fix_review is
 // accepted; gates with only non-actionable findings are approved. Each step is
 // fixed at most once so a finding the fix cannot clear converges to an approval
-// instead of looping forever.
+// instead of looping forever. Protected-path refusals always return their gate
+// for an explicit response, including under --yes.
 //
 // The CI step monitors an open PR until a human merges or closes it (a live
 // status the TUI shows), so it never reaches a terminal state on its own. An
@@ -454,6 +577,10 @@ func driveRunWithReconciler(ctx context.Context, progress io.Writer, client *ipc
 		}
 		if gate, ok := rv.awaitingStep(); ok {
 			if !autoApprove {
+				return run, false, nil
+			}
+			if pipeline.HasProtectedPathRefusal(gate.FindingsJSON) {
+				fmt.Fprintf(progress, "%s: protected-path refusal requires an explicit response; --yes leaves this gate awaiting a response\n", gate.Name)
 				return run, false, nil
 			}
 			gateKey := gate.Name + "\x00" + gate.Status
@@ -629,7 +756,7 @@ func renderDriveResult(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool) error
 		return nil
 	}
 
-	fields = append(fields, toon.Field{Key: "outcome", Value: outcomeFor(rv.Status)})
+	fields = append(fields, toon.Field{Key: "outcome", Value: outcomeForRun(rv)})
 	if run.Error != nil && *run.Error != "" {
 		fields = append(fields, toon.Field{Key: "error", Value: *run.Error})
 	}
@@ -638,6 +765,12 @@ func renderDriveResult(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool) error
 		fixes := rv.fixRows()
 		fields = appendFixesField(fields, fixes)
 		var help []string
+		if rv.CIOverrideReason != "" {
+			help = append(help, fmt.Sprintf("A human approved past a live CI failure: %s", rv.CIOverrideReason))
+		}
+		if len(rv.automaticSkips()) > 0 {
+			help = append(help, "Publication or CI verification did not run (see `run.automatic_skips` and `run.head_sha`). Report the missing evidence and its cause; this outcome does not establish CI readiness or a code failure.")
+		}
 		if rv.PRURL != "" {
 			help = append(help, fmt.Sprintf("Open the PR: %s", rv.PRURL))
 		}
@@ -726,7 +859,7 @@ func newAxiRespondCmd() *cobra.Command {
 	cmd.Flags().StringVar(&findings, "findings", "", "comma-separated finding IDs to fix (with --action fix)")
 	cmd.Flags().StringVar(&instructions, "instructions", "", "guidance applied to the selected findings (with --action fix)")
 	cmd.Flags().StringVar(&addFinding, "add-finding", "", "JSON finding object to add and fix (with --action fix)")
-	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve every subsequent gate until a decision point or outcome")
+	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve subsequent eligible gates until a decision point or outcome; protected-path refusals require an explicit response")
 	return cmd
 }
 
