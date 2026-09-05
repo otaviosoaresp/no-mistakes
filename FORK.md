@@ -125,6 +125,13 @@ make build                       # then reinstall as above
 
 `skills/no-mistakes/SKILL.md` is generated from the `body` constant in `internal/skill/skill.go`. After resolving a conflict that touches either, run `make skill`; `make lint` fails on drift.
 
+Two CI checks always fail on an upstream-sync PR here, and neither is a regression:
+
+- **Generated files must not be hand-edited** - the merge carries upstream's release-please `CHANGELOG.md` and `.release-please-manifest.json` updates, and the guard rejects any PR that touches them. It exists to police contributor feature PRs, which a sync is not.
+- **PR must be raised via no-mistakes** - a bulk sync ships direct-PR, without the pipeline.
+
+Judge a sync on `make lint`, `go build ./...`, `go test ./...`, and the CI build/test legs instead.
+
 ### Model and effort per purpose
 
 `agent_config` was keyed by agent name only, so review, the review fixer, and the documentation pass all ran on one model at one effort. Those three duties are 63% of measured token spend here, which made a single global effort the only lever - and lowering it weakened the initial review, the pass that actually catches bugs.
