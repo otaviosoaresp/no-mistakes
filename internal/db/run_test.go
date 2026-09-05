@@ -65,7 +65,7 @@ func TestInsertRunWithIntent(t *testing.T) {
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
 	intent := RunIntent{Summary: "  exact requirements\n", Source: RunIntentSourceRerun, Score: 1}
 
-	run, err := d.InsertRunWithIntent(repo.ID, "feature", "abc123", "def456", &intent)
+	run, err := d.InsertRunWithIntent(repo.ID, "feature", "abc123", "def456", &intent, "epic/feature")
 	if err != nil {
 		t.Fatalf("insert run with intent: %v", err)
 	}
@@ -78,6 +78,9 @@ func TestInsertRunWithIntent(t *testing.T) {
 	}
 	if got.IntentSource == nil || *got.IntentSource != intent.Source {
 		t.Fatalf("intent source = %v, want %q", got.IntentSource, intent.Source)
+	}
+	if got.PRBaseBranch == nil || *got.PRBaseBranch != "epic/feature" {
+		t.Fatalf("PRBaseBranch = %#v, want epic/feature", got.PRBaseBranch)
 	}
 }
 
@@ -1039,6 +1042,27 @@ func TestRecoverStaleRunsNoStaleRuns(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("recovered count = %d, want 0", count)
+	}
+}
+
+func TestSetRunsCustodyReturnedIsAtomic(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/stacked-custody", "git@github.com:user/stacked-custody.git", "main")
+	first, _ := d.InsertRun(repo.ID, "feat", "abc", "def")
+	second, _ := d.InsertRun(repo.ID, "feat", "ghi", "def")
+	_, err := d.sql.Exec(`CREATE TEMP TRIGGER fail_second_custody_stamp BEFORE UPDATE OF custody_returned_at ON runs WHEN OLD.id = '` + second.ID + `' BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.SetRunsCustodyReturned([]string{first.ID, second.ID}); err == nil {
+		t.Fatal("stacked custody stamp succeeded")
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		run, err := d.GetRun(id)
+		if err != nil || run == nil || run.CustodyReturnedAt != nil {
+			t.Fatalf("run %s custody = %#v, %v", id, run, err)
+		}
 	}
 }
 
