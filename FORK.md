@@ -23,6 +23,8 @@ When the budget is spent the step **parks**. It does not approve itself and it d
 - `axi run --yes` approves such a gate, the same way it already approves one it has fixed once
 - the effective budget is persisted per step result (`step_results.max_rounds`), mirroring `auto_fix_limit`
 
+The refusal lives at **both** gate-driving sites. `Executor.Resume` drives a gate that was parked when the daemon went down, and it answers `ActionFix` on its own path rather than through `executeStep`'s gate loop, so it carries its own budget check and its own re-park. Without it the budget bound only the lifetime of the daemon that started the run and every restart bought one more round of the loop this patch exists to bound. Regressions: `TestExecutor_MaxRoundsRefusesFurtherAgentFixRounds` (live gate) and `TestExecutor_MaxRoundsRefusesAgentFixRoundOnARecoveredGate` (recovered gate).
+
 Config surface is documented in `docs/src/content/docs/reference/global-config.md` (`max_rounds`) and `docs/src/content/docs/reference/repo-config.md`.
 
 Touches: `internal/config/config.go`, `internal/pipeline/executor.go`, `internal/db/{schema,step}.go`, `internal/ipc/protocol.go`, `internal/daemon/daemon.go`, `internal/cli/{axi_render,axi_drive}.go`, `internal/skill/skill.go`.

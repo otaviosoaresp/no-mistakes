@@ -427,119 +427,153 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		slog.Warn("could not reconcile recovered approval gate; preserving it", "run_id", run.ID, "step", gate.step.Name(), "error", reconcileErr)
 	}
 
-	e.mu.Lock()
-	e.waiting = true
-	e.waitingStep = gate.step.Name()
-	e.waitingProtectedPath = HasProtectedPathRefusal(gate.findings)
-	e.mu.Unlock()
-	e.emitStepEventWithFindingsAndError(
-		ipc.EventStepCompleted,
-		run,
-		repo,
-		gate.step.Name(),
-		string(gate.stepResult.Status),
-		gate.findings,
-		"",
-		gate.stepResult.DurationMS,
-	)
-
-	response, reconciled, err := e.waitForApprovalOrReconcile(ctx, gate.step, reconcileCtx, gate.findings, false)
-	if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
-		slog.Warn("failed to complete awaiting-agent state in db", "step", gate.step.Name(), "run", run.ID, "error", dbErr)
+	maxRounds := e.maxRoundsLimit(gate.step.Name())
+	// A recovered gate answers ActionFix on this path instead of executeStep's
+	// gate loop, so the round budget has to be enforced here too. Without it
+	// max_rounds binds only while the daemon that started the run is alive, and
+	// every restart buys one more round of the very loop it exists to bound.
+	// Exhaustion withdraws only the fix action: the findings are untouched and
+	// approve, skip, and abort stay with whoever is driving the run.
+	roundBudgetSpent := func() bool {
+		return maxRounds > 0 && gate.round >= maxRounds
 	}
-	if err != nil {
-		if dbErr := e.db.FailStep(gate.stepResult.ID, err.Error(), duration); dbErr != nil {
-			slog.Warn("failed to mark recovered step as failed in db", "step", gate.step.Name(), "error", dbErr)
+	stepLogPath := filepath.Join(logDir, string(gate.step.Name())+".log")
+	appendStepLog := func(text string) {
+		text = "\n" + strings.TrimRight(text, "\n") + "\n\n"
+		if f, openErr := os.OpenFile(stepLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); openErr == nil {
+			_, _ = f.WriteString(text)
+			_ = f.Close()
 		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", err.Error(), &duration)
-		return e.failRun(run, repo, fmt.Errorf("step %s: waiting for approval: %w", gate.step.Name(), err), ctx)
-	}
-	if reconciled {
-		return completeReconciledGate()
+		e.emitLogChunk(run, repo, gate.step.Name(), text)
 	}
 
-	approvalFields := telemetry.Fields{
-		"step":       string(gate.step.Name()),
-		"action":     string(response.action),
-		"fix_review": gate.stepResult.Status == types.StepStatusFixReview,
-	}
-	if agentName := e.telemetryAgentName(); agentName != "" {
-		approvalFields["agent"] = agentName
-	}
-	if selectedCount := selectedFindingCount(gate.findings, response.findingIDs); selectedCount > 0 {
-		approvalFields["selected_findings_count"] = selectedCount
-	}
-	telemetry.Track("approval", approvalFields)
-	switch response.action {
-	case types.ActionApprove:
-		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
-		if err := e.applyApprovalOverride(gate.step, reconcileCtx, gate.stepResult.ID); err != nil {
-			return e.failRun(run, repo, err, ctx)
+gate:
+	for {
+		e.mu.Lock()
+		e.waiting = true
+		e.waitingStep = gate.step.Name()
+		e.waitingProtectedPath = HasProtectedPathRefusal(gate.findings)
+		e.mu.Unlock()
+		e.emitStepEventWithFindingsAndError(
+			ipc.EventStepCompleted,
+			run,
+			repo,
+			gate.step.Name(),
+			string(gate.stepResult.Status),
+			gate.findings,
+			"",
+			gate.stepResult.DurationMS,
+		)
+
+		response, reconciled, err := e.waitForApprovalOrReconcile(ctx, gate.step, reconcileCtx, gate.findings, false)
+		if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
+			slog.Warn("failed to complete awaiting-agent state in db", "step", gate.step.Name(), "run", run.ID, "error", dbErr)
 		}
-		if err := completeRecoveredGate(); err != nil {
-			return e.failRun(run, repo, fmt.Errorf("complete recovered step %s: %w", gate.step.Name(), err), ctx)
-		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
-	case types.ActionSkip:
-		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
-		if err := e.db.CompleteStepWithStatus(gate.stepResult.ID, types.StepStatusSkipped, recoveredExitCode(gate.stepResult), duration, recoveredLogPath(gate.stepResult)); err != nil {
-			return e.failRun(run, repo, fmt.Errorf("skip recovered step %s: %w", gate.step.Name(), err), ctx)
-		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusSkipped), "", "", &duration)
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
-	case types.ActionAbort:
-		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
-		if dbErr := e.db.FailStep(gate.stepResult.ID, "aborted by user", duration); dbErr != nil {
-			slog.Warn("failed to mark recovered step as aborted", "step", gate.step.Name(), "error", dbErr)
-		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
-		return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
-	case types.ActionFix:
-		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
-		selected := filterFindingsJSON(gate.findings, response.findingIDs)
-		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
-		if gate.lastRoundID != "" {
-			allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, merged)
-			if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
-				var userFindingsJSON *string
-				if merged != "" && merged != selected {
-					userFindingsJSON = &merged
-				}
-				if dbErr := e.db.SetStepRoundUserDecision(gate.lastRoundID, &idsJSON, db.RoundSelectionSourceUser, userFindingsJSON); dbErr != nil {
-					slog.Warn("failed to record recovered user decision", "step", gate.step.Name(), "round", gate.round, "error", dbErr)
-				}
-			}
-		}
-		if dbErr := e.db.StartStepFixRound(gate.stepResult.ID, e.autoFixLimit(gate.step.Name())); dbErr != nil {
-			return e.failRun(run, repo, fmt.Errorf("mark recovered step %s fixing: %w", gate.step.Name(), dbErr), ctx)
-		}
-		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFixing), "", "", nil)
-		skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
-			fixing:           true,
-			previousFindings: merged,
-			deferredFindings: removeMatchingFindingsJSON(gate.findings, selected),
-			roundNum:         gate.round,
-			autoFixAttempts:  gate.autoFixes,
-			executionMS:      duration,
-			currentRoundID:   gate.lastRoundID,
-		})
 		if err != nil {
-			return e.failRun(run, repo, err, ctx)
-		}
-		if skipRemaining {
-			return e.skipRecoveredRemainder(run, repo, gate.index+1)
-		}
-		if restartFrom != "" {
-			restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, gate.index)
-			if indexErr != nil {
-				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", gate.step.Name(), restartFrom), ctx)
+			if dbErr := e.db.FailStep(gate.stepResult.ID, err.Error(), duration); dbErr != nil {
+				slog.Warn("failed to mark recovered step as failed in db", "step", gate.step.Name(), "error", dbErr)
 			}
-			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, restartIndex, true)
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", err.Error(), &duration)
+			return e.failRun(run, repo, fmt.Errorf("step %s: waiting for approval: %w", gate.step.Name(), err), ctx)
 		}
-		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
-	default:
-		return e.failRun(run, repo, fmt.Errorf("step %s: unsupported approval action %q", gate.step.Name(), response.action), ctx)
+		if reconciled {
+			return completeReconciledGate()
+		}
+
+		approvalFields := telemetry.Fields{
+			"step":       string(gate.step.Name()),
+			"action":     string(response.action),
+			"fix_review": gate.stepResult.Status == types.StepStatusFixReview,
+		}
+		if agentName := e.telemetryAgentName(); agentName != "" {
+			approvalFields["agent"] = agentName
+		}
+		if selectedCount := selectedFindingCount(gate.findings, response.findingIDs); selectedCount > 0 {
+			approvalFields["selected_findings_count"] = selectedCount
+		}
+		telemetry.Track("approval", approvalFields)
+		switch response.action {
+		case types.ActionApprove:
+			e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
+			if err := e.applyApprovalOverride(gate.step, reconcileCtx, gate.stepResult.ID); err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			if err := completeRecoveredGate(); err != nil {
+				return e.failRun(run, repo, fmt.Errorf("complete recovered step %s: %w", gate.step.Name(), err), ctx)
+			}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
+			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		case types.ActionSkip:
+			e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
+			if err := e.db.CompleteStepWithStatus(gate.stepResult.ID, types.StepStatusSkipped, recoveredExitCode(gate.stepResult), duration, recoveredLogPath(gate.stepResult)); err != nil {
+				return e.failRun(run, repo, fmt.Errorf("skip recovered step %s: %w", gate.step.Name(), err), ctx)
+			}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusSkipped), "", "", &duration)
+			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		case types.ActionAbort:
+			e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
+			if dbErr := e.db.FailStep(gate.stepResult.ID, "aborted by user", duration); dbErr != nil {
+				slog.Warn("failed to mark recovered step as aborted", "step", gate.step.Name(), "error", dbErr)
+			}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
+			return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
+		case types.ActionFix:
+			if roundBudgetSpent() {
+				// Refusing here rather than silently approving keeps the
+				// verdict with the driver: the findings stay blocking and the
+				// same gate is published again.
+				appendStepLog(fmt.Sprintf("fix refused: round budget spent (%d/%d). Respond with approve, skip, or abort, or raise max_rounds.%s", gate.round, maxRounds, gate.step.Name()))
+				parkStart = time.Now()
+				if dbErr := e.db.ParkStepForApproval(run.ID, gate.stepResult.ID, gate.stepResult.Status, duration, &gate.findings); dbErr != nil {
+					return e.failRun(run, repo, fmt.Errorf("re-park recovered step %s: %w", gate.step.Name(), dbErr), ctx)
+				}
+				continue gate
+			}
+			telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
+			selected := filterFindingsJSON(gate.findings, response.findingIDs)
+			merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
+			if gate.lastRoundID != "" {
+				allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, merged)
+				if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
+					var userFindingsJSON *string
+					if merged != "" && merged != selected {
+						userFindingsJSON = &merged
+					}
+					if dbErr := e.db.SetStepRoundUserDecision(gate.lastRoundID, &idsJSON, db.RoundSelectionSourceUser, userFindingsJSON); dbErr != nil {
+						slog.Warn("failed to record recovered user decision", "step", gate.step.Name(), "round", gate.round, "error", dbErr)
+					}
+				}
+			}
+			if dbErr := e.db.StartStepFixRound(gate.stepResult.ID, e.autoFixLimit(gate.step.Name())); dbErr != nil {
+				return e.failRun(run, repo, fmt.Errorf("mark recovered step %s fixing: %w", gate.step.Name(), dbErr), ctx)
+			}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFixing), "", "", nil)
+			skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
+				fixing:           true,
+				previousFindings: merged,
+				deferredFindings: removeMatchingFindingsJSON(gate.findings, selected),
+				roundNum:         gate.round,
+				autoFixAttempts:  gate.autoFixes,
+				executionMS:      duration,
+				currentRoundID:   gate.lastRoundID,
+			})
+			if err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			if skipRemaining {
+				return e.skipRecoveredRemainder(run, repo, gate.index+1)
+			}
+			if restartFrom != "" {
+				restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, gate.index)
+				if indexErr != nil {
+					return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", gate.step.Name(), restartFrom), ctx)
+				}
+				return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, restartIndex, true)
+			}
+			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
+		default:
+			return e.failRun(run, repo, fmt.Errorf("step %s: unsupported approval action %q", gate.step.Name(), response.action), ctx)
+		}
 	}
 }
 
