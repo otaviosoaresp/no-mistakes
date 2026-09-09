@@ -88,27 +88,20 @@ max_rounds:
 auto_fix:
   review: 3
 
-# The review loop is pinned through upstream's review_agents, not through this
-# fork's purposes patch: it selects the role outright rather than narrowing a
-# harness-wide profile, and it can move a role to a different harness.
-review_agents:
-  fixer:
-    agent: claude
-    effort: medium
-
-# purposes keeps every duty outside the review loop. review itself is left
-# alone: no base model or effort is pinned, because it is the pass that
-# actually catches bugs.
+# Duty tuning goes through purposes, not through upstream's review_agents -
+# see "Model and effort per purpose" above for why, given `agent: auto`.
 agent_config:
   claude:
     purposes:
+      review-fix:
+        effort: medium
       housekeeping:
         effort: low
 ```
 
-The duty choices come from the local telemetry, not from taste: the review fixer is 32.5% of all tokens and `housekeeping` 12.8%, and neither judges the change - one applies findings a review round already prescribed, the other edits documentation. Read your own split with `no-mistakes stats` before copying these.
+The duty choices come from the local telemetry, not from taste: `review-fix` is 32.5% of all tokens and `housekeeping` 12.8%, and neither judges the change - one applies findings a review round already prescribed, the other edits documentation. `review` itself is left alone. Read your own split with `no-mistakes stats` before copying these.
 
-Every value here is per host. `max_rounds` and `auto_fix` in particular were set independently on this machine and on the Coder workspace.
+Every value here is per host, and the Coder workspace runs a longer version of this block (a pinned `opus`/`high` base plus `test-fix`, `lint-fix`, and `document-fix`). `max_rounds` and `auto_fix` in particular were set independently on each machine.
 
 ## Building and installing over the released binary
 
@@ -198,9 +191,11 @@ Config surface is documented in `docs/src/content/docs/reference/global-config.m
 
 Touches: `internal/types/purpose.go`, `internal/agent/purpose.go`, `internal/agentcfg/agentcfg.go`, `internal/config/config.go`, `internal/daemon/manager.go`, `internal/pipeline/instrument.go`.
 
-Since v1.72.0 upstream ships `review_agents`, which pins the `reviewer` and `fixer` roles to an explicit harness plus model and effort. It is the better tool for the review loop - it selects the role outright instead of narrowing a harness-wide profile, and it is the only one of the two that can move a role to a different harness - so this fork configures the review loop there and leaves `purposes` to govern every other duty. The two compose rather than compete: `Config.ForReviewAgent` writes the role's profile as a base with no purpose deltas, so the more specific setting wins and a `review`/`review-fix` delta can never re-narrow a role the operator pinned explicitly.
+Since v1.72.0 upstream ships `review_agents`, which pins the `reviewer` and `fixer` roles to an explicit harness plus model and effort. The two mechanisms compose rather than compete: `Config.ForReviewAgent` writes the role's profile as an `AgentTuning` base with no purpose deltas, so a `review`/`review-fix` delta can never re-narrow a role the operator pinned explicitly, and `purposes` keeps governing every duty outside the review loop.
 
-`purposes` is kept because `review_agents` has exactly two roles. `housekeeping` - 12.8% of measured spend here - has no role to be pinned to, and neither does any other non-review duty.
+Both hosts here nonetheless still tune the review loop through `purposes`, deliberately. `review_agents` requires an explicit harness - `agentcfg.Known` refuses `auto` - and `ForReviewAgent` sets `role.Agents` to that single harness. Under this fork's `agent: auto`, adopting it would collapse the fallback chain for exactly the two duties where a dead harness is most expensive: on the Coder workspace `codex` is installed and green, so today a `claude` outage leaves review running, and a pinned role would fail it instead. Reach for `review_agents` when you actually want a role on a *different* harness from the rest of the pipeline; that is the thing `purposes` cannot express.
+
+`purposes` is also the only one of the two with reach beyond review: `review_agents` has exactly two roles, and `housekeeping` - 12.8% of measured spend here - has none to be pinned to, nor does any other non-review duty.
 
 ## Deliberately not done
 
