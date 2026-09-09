@@ -37,6 +37,25 @@ Documented in `docs/src/content/docs/reference/environment.md` (`CLAUDE_CONFIG_D
 
 Touches: `internal/skill/install.go`.
 
+### Upstream's release channel is not this build's update channel
+
+This is the one patch that does **not** default to upstream behavior, deliberately.
+
+A fork build is cut from a tag upstream has already moved past, so its version always compares older than the latest release. Every run of any command therefore printed `A new version of no-mistakes is available: v1.66.0-14-gc30f8cf -> v1.73.0 / Run "no-mistakes update" to update` on stderr - and that advertised command is the one thing that must never run here: it downloads an upstream release and overwrites the fork binary with a build carrying none of the patches above, silently, with no warning that anything was lost.
+
+`updater.forkBuild` is set by `defaultUpdater`, so every real binary built from this repository has the whole remote channel closed at four seams:
+
+- the stderr notice, and the background refresh it spawns (`maybeNotifyAndCheck`)
+- the TUI's "update available" banner (`cachedLatestVersion`, consumed by `internal/cli/attach.go`)
+- the `--update-check` background subprocess (`MaybeHandleBackgroundCheck`, which still claims the flag so an older installed binary's spawn exits cleanly instead of reaching the cobra root as an unknown command)
+- `no-mistakes update` itself, which now prints a refusal pointing here instead of downloading anything
+
+Nothing reaches `api.github.com` for release metadata any more, and `NO_MISTAKES_NO_UPDATE_CHECK` is no longer needed on any host.
+
+Updating is the build-and-install procedure below. The field is left `false` in tests so the upstream behavior they cover stays exercised; flipping it in `defaultUpdater` restores the released binary's behavior in full.
+
+Touches: `internal/update/update.go`. Regressions: `internal/update/fork_test.go`.
+
 ## Local configuration this fork assumes
 
 Neither patch does anything until configured. The operator config that makes the round budget active lives in `~/.no-mistakes/config.yaml`:
@@ -108,7 +127,7 @@ scp no-mistakes-linux-arm64 <host>:/tmp/no-mistakes-fork
 
 Match `GOARCH` to the target - the Coder workspace is `aarch64`, this machine is `amd64`. Compare `sha256sum` on both ends before installing, then follow the same stop, back up, replace, start sequence as above, and finish with `no-mistakes init` from a registered repository to refresh the skill.
 
-Persistence on the Coder workspace: `/home` is its own volume, so `~/.no-mistakes` and the `~/.local/bin/no-mistakes` symlink survive a stop and start, and no template or dotfiles script reinstalls the released binary over ours. `no-mistakes update` still would.
+Persistence on the Coder workspace: `/home` is its own volume, so `~/.no-mistakes` and the `~/.local/bin/no-mistakes` symlink survive a stop and start, and no template or dotfiles script reinstalls the released binary over ours. `no-mistakes update` used to be the remaining way to lose the fork build by accident; since the update-channel patch above it refuses instead.
 
 The operator config is per host and does not travel with the binary - set `max_rounds` on each machine separately.
 

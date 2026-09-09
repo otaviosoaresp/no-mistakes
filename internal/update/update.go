@@ -62,6 +62,15 @@ type updater struct {
 	includePrereleases bool
 	assumeYes          bool
 	force              bool
+	// forkBuild marks this binary as the private-use fork described in
+	// FORK.md. Upstream's release channel is not this build's update channel:
+	// its releases carry none of the fork's patches, and their version numbers
+	// are always ahead of a fork build cut from an older tag, so every remote
+	// check produces a notice advertising `no-mistakes update` - the one
+	// command that silently replaces the fork binary with an upstream one.
+	// Set for every real binary by defaultUpdater; left false in tests so the
+	// upstream behavior they cover stays exercised.
+	forkBuild bool
 }
 
 type RunOptions struct {
@@ -92,6 +101,9 @@ func MaybeHandleBackgroundCheck(args []string) (bool, error) {
 	u, err := defaultUpdater(io.Discard, io.Discard)
 	if err != nil {
 		return true, err
+	}
+	if u.forkBuild {
+		return true, nil
 	}
 	u.currentVersion = args[1]
 	return true, u.refreshCache(context.Background())
@@ -136,6 +148,7 @@ func defaultUpdater(stdout, stderr io.Writer) (*updater, error) {
 		stderr:          stderr,
 		now:             time.Now,
 		paths:           p,
+		forkBuild:       true,
 		spawnBackground: defaultSpawnBackground,
 		resetDaemon: func() error {
 			return defaultResetDaemon(p)
@@ -155,7 +168,7 @@ func (u *updater) refreshCache(ctx context.Context) error {
 }
 
 func (u *updater) maybeNotifyAndCheck(args []string) {
-	if u.disableBackground || isDevVersion(u.currentVersion) || os.Getenv(noUpdateCheckEnv) == "1" {
+	if u.forkBuild || u.disableBackground || isDevVersion(u.currentVersion) || os.Getenv(noUpdateCheckEnv) == "1" {
 		return
 	}
 	// Informational commands must be side-effect-free probes: `update` and the
@@ -178,7 +191,7 @@ func (u *updater) maybeNotifyAndCheck(args []string) {
 }
 
 func (u *updater) cachedLatestVersion() string {
-	if u == nil || u.disableBackground || isDevVersion(u.currentVersion) || os.Getenv(noUpdateCheckEnv) == "1" {
+	if u == nil || u.forkBuild || u.disableBackground || isDevVersion(u.currentVersion) || os.Getenv(noUpdateCheckEnv) == "1" {
 		return ""
 	}
 	cache := readCache(u.cachePath)
@@ -193,6 +206,10 @@ func (u *updater) cachedLatestVersion() string {
 }
 
 func (u *updater) run(ctx context.Context) error {
+	if u.forkBuild {
+		fmt.Fprintf(u.stdoutWriter(), "self-update is disabled for this private-use fork build (%s)\nupstream releases carry none of this fork's patches; rebuild from source instead (see FORK.md)\n", u.currentVersion)
+		return nil
+	}
 	if isDevVersion(u.currentVersion) {
 		fmt.Fprintf(u.stdoutWriter(), "self-update unavailable for development builds (%s)\n", u.currentVersion)
 		return nil
