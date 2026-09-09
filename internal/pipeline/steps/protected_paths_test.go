@@ -66,7 +66,7 @@ func TestCIStep_ProtectedPathRetryUsesPersistedRepair(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				return &agent.Result{Output: json.RawMessage(`{"summary":"repair CI","code_change_needed":true}`)}, nil
+				return &agent.Result{Output: json.RawMessage(`{"summary":"repair CI","code_change_needed":true,"findings":[],"tested":["go test ./..."],"testing_summary":"re-verified the repaired behaviour","artifacts":[],"scenarios":[{"name":"the repaired behaviour works for a user","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
 			}}
 			f.sctx.Config.ProtectedPaths = []string{"*.lock"}
 			outcome, err := f.run(t)
@@ -96,12 +96,24 @@ func TestCIStep_ProtectedPathRetryUsesPersistedRepair(t *testing.T) {
 			f.sctx.Config.Commands.Test = "git cat-file -e HEAD:fix.go"
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			green := fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`)
+			green := append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`),
+				// attestHeadBeforePush discovers the PR via FindPR before every
+				// publish, matching the persisted PRURL the fixture set up.
+				`FAKE_CLI_PR_LIST_JSON=[{"number":42,"url":"https://github.com/test/repo/pull/42","baseRefName":"main"}]`,
+			)
 			ci := &CIStep{waitForNextPoll: func(context.Context, time.Duration) error { cancel(); return ctx.Err() }}
-			steps := []pipeline.Step{&ReviewStep{}, &TestStep{}, &PushStep{}, reconcileEnvStep{step: ci, env: green}}
+			// Push now also attests the PR's pipeline before every push (see
+			// attestHeadBeforePush), so it needs the same fake gh reachability
+			// CI already gets here - real production code shares one process
+			// environment across every step, but the executor this test drives
+			// resets StepContext.Env per step and this fixture only injects it
+			// explicitly via reconcileEnvStep.
+			steps := []pipeline.Step{&ReviewStep{}, &TestStep{}, reconcileEnvStep{step: &PushStep{}, env: green}, reconcileEnvStep{step: ci, env: green}}
 			reviews := 0
-			ag := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
-				reviews++
+			ag := &mockAgent{name: "test", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+				if strings.HasPrefix(opts.Purpose, "review") {
+					reviews++
+				}
 				output, err := json.Marshal(cleanReviewFindings())
 				return &agent.Result{Output: output}, err
 			}}
@@ -140,7 +152,7 @@ func TestCIStep_ProtectedPathRetryUsesPersistedRepair(t *testing.T) {
 				t.Fatal("refusal did not resume")
 			}
 			refused, err := types.ParseFindingsJSON(outcome.Findings)
-			if err != nil || len(refused.Items) != 1 {
+			if err != nil || len(refused.Items) < 1 || refused.Items[0].ID != "protected-path-refusal" {
 				t.Fatalf("invalid refusal: %+v, %v", refused, err)
 			}
 			selected := []string{refused.Items[0].ID}
@@ -252,7 +264,8 @@ func TestCIStep_ProtectedPathRetryFinishesRetainedRepairWithGreenChecks(t *testi
 			persistCIRefusal(t, f, outcome)
 			f.sctx.Fixing = true
 			f.sctx.PreviousFindings = outcome.Findings
-			f.sctx.Env = fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`)
+			f.sctx.Env = append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`),
+				`FAKE_CLI_PR_LIST_JSON=[{"number":42,"url":"https://github.com/test/repo/pull/42","baseRefName":"main"}]`)
 			outcome, err = f.run(t)
 			if err != nil || outcome == nil || !pipeline.HasProtectedPathRefusal(outcome.Findings) || calls != 1 || f.localHead(t) != f.headSHA {
 				t.Fatalf("unresolved retry bypassed refusal or reran fixer: %+v, %v calls=%d", outcome, err, calls)
@@ -260,7 +273,8 @@ func TestCIStep_ProtectedPathRetryFinishesRetainedRepairWithGreenChecks(t *testi
 			if err := os.Remove(filepath.Join(f.dir, "package.lock")); err != nil {
 				t.Fatal(err)
 			}
-			f.sctx.Env = fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`)
+			f.sctx.Env = append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`),
+				`FAKE_CLI_PR_LIST_JSON=[{"number":42,"url":"https://github.com/test/repo/pull/42","baseRefName":"main"}]`)
 			outcome, err = f.run(t)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Fatalf("retry: %+v, %v\n%s", outcome, err, f.log())
@@ -308,7 +322,8 @@ func TestCIStep_ProtectedPathRetryPublicationFailureKeepsRefusal(t *testing.T) {
 	if err := os.Remove(filepath.Join(f.dir, "package.lock")); err != nil {
 		t.Fatal(err)
 	}
-	f.sctx.Env = fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`)
+	f.sctx.Env = append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"SUCCESS","bucket":"pass"}]`),
+		`FAKE_CLI_PR_LIST_JSON=[{"number":42,"url":"https://github.com/test/repo/pull/42","baseRefName":"main"}]`)
 	hooks := t.TempDir()
 	gitCmd(t, f.upstream, "config", "core.hooksPath", hooks)
 	rejectPush := filepath.Join(hooks, "pre-receive")
@@ -321,8 +336,17 @@ func TestCIStep_ProtectedPathRetryPublicationFailureKeepsRefusal(t *testing.T) {
 	}
 	persistCIRefusal(t, f, outcome)
 	findings, err := types.ParseFindingsJSON(outcome.Findings)
-	if err != nil || len(findings.Items) != 1 || findings.Items[0].File != "package.lock" || !strings.Contains(findings.Items[0].Description, `rule "*.lock"`) {
-		t.Fatalf("retry lost original path or rule: %+v, %v", findings, err)
+	if err != nil {
+		t.Fatalf("retry findings: %+v, %v", findings, err)
+	}
+	var refusal types.Finding
+	for _, finding := range findings.Items {
+		if finding.File == "package.lock" {
+			refusal = finding
+		}
+	}
+	if !strings.Contains(refusal.Description, `rule "*.lock"`) {
+		t.Fatalf("retry lost original path or rule: %+v", findings)
 	}
 	if strings.Contains(f.log(), ciChecksPassedMsg) || f.remoteHead(t) != f.headSHA {
 		t.Fatal("unfinished publication advanced remote or reported checks passed")
@@ -364,32 +388,46 @@ func TestCIStep_ProtectedPathRefusalStopsAutomaticAndManualRepair(t *testing.T) 
 						t.Fatal(err)
 					}
 				}
-				return &agent.Result{Output: json.RawMessage(`{"summary":"repair checks","code_change_needed":true}`)}, nil
+				return &agent.Result{Output: json.RawMessage(`{"summary":"repair checks","code_change_needed":true,"findings":[],"tested":["go test ./..."],"testing_summary":"re-verified the repaired behaviour","artifacts":[],"scenarios":[{"name":"the repaired behaviour works for a user","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
 			}}
 			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-			sctx.Env = fakeCIGH(t, "OPEN", `[{"name":"test","state":"FAILURE","bucket":"fail"}]`)
+			sctx.Env = append(fakeCIGH(t, "OPEN", `[{"name":"test","state":"FAILURE","bucket":"fail","app":"github-actions"},{"name":"Greptile Review","state":"FAILURE","bucket":"fail","app":"greptile-apps"}]`), `FAKE_CLI_REVIEW_COMMENTS=[{"author":"greptile-apps[bot]","path":"main.go","line":4,"body":"deferred bot finding"}]`)
 			prURL := "https://github.com/test/repo/pull/42"
 			sctx.Run.PRURL = &prURL
 			sctx.Config.ProtectedPaths = []string{"*.lock"}
 			sctx.Config.AutoFix.CI = 3
 			sctx.Config.CITimeout = time.Minute
 			sctx.Fixing = manual
+			if manual {
+				sctx.PreviousFindings = ciGateFindingsJSON("test")
+				sctx.DeferredFindings = `{"findings":[{"id":"ci-2","severity":"warning","description":"deferred bot finding","action":"ask-user","category":"ci-review-bot","check":"Greptile Review"}],"summary":"review bot finding"}`
+			}
 			polls := 0
 			step := &CIStep{waitForNextPoll: func(context.Context, time.Duration) error {
 				polls++
 				return nil
 			}}
-			outcome, err := step.Execute(sctx)
+			outcome, err := driveCI(t, step, sctx)
 			if err != nil || outcome == nil || !outcome.NeedsApproval || outcome.AutoFixable {
 				t.Fatalf("refusal must park for an operator: outcome=%+v err=%v", outcome, err)
 			}
 			findings, err := types.ParseFindingsJSON(outcome.Findings)
-			if err != nil || len(findings.Items) != 1 {
+			if err != nil || len(findings.Items) != 3 {
 				t.Fatalf("refusal findings=%+v err=%v", findings, err)
 			}
-			finding := findings.Items[0]
-			if finding.File != "package.lock" || finding.Action != types.ActionAskUser || !strings.Contains(finding.Description, `rule "*.lock"`) {
-				t.Errorf("refusal lost the path, rule, or decision: %+v", finding)
+			var refusal types.Finding
+			byCategory := map[string]types.Finding{}
+			for _, finding := range findings.Items {
+				if finding.File == "package.lock" {
+					refusal = finding
+				}
+				byCategory[finding.Category] = finding
+			}
+			if refusal.Action != types.ActionAskUser || !strings.Contains(refusal.Description, `rule "*.lock"`) {
+				t.Errorf("refusal lost the path, rule, or decision: %+v", refusal)
+			}
+			if byCategory[types.FindingCategoryCICheck].Check != "test" || byCategory[types.FindingCategoryCIReviewBot].Check != "Greptile Review" {
+				t.Errorf("refusal lost selected or deferred findings: %+v", findings.Items)
 			}
 			if invocations != 1 || polls != 0 {
 				t.Errorf("refusal retried: invocations=%d polls=%d", invocations, polls)
@@ -425,7 +463,7 @@ func TestTestStep_FixMode_ProtectedPathDoesNotReachCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		return &agent.Result{Output: json.RawMessage(`{"summary":"repair test failure"}`)}, nil
+		return &agent.Result{Output: json.RawMessage(`{"summary":"repair test failure","findings":[],"tested":["go test ./..."],"testing_summary":"re-verified the repaired behaviour","artifacts":[],"scenarios":[{"name":"the repaired behaviour works for a user","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
 	}}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	repo, err := config.LoadRepoFromBytes([]byte("commands:\n  test: exit 0\nprotected_paths:\n  - generated-ledger.json\n"))

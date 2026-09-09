@@ -302,6 +302,7 @@ func (e *Executor) initializeRunScopes(runID string) {
 type stepExecutionState struct {
 	fixing           bool
 	previousFindings string
+	deferredFindings string
 	roundNum         int
 	autoFixAttempts  int
 	executionMS      int64
@@ -510,13 +511,14 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 				}
 			}
 		}
-		if dbErr := e.db.UpdateStepStatus(gate.stepResult.ID, types.StepStatusFixing); dbErr != nil {
+		if dbErr := e.db.StartStepFixRound(gate.stepResult.ID, e.autoFixLimit(gate.step.Name())); dbErr != nil {
 			return e.failRun(run, repo, fmt.Errorf("mark recovered step %s fixing: %w", gate.step.Name(), dbErr), ctx)
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFixing), "", "", nil)
 		skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
 			fixing:           true,
 			previousFindings: merged,
+			deferredFindings: removeMatchingFindingsJSON(gate.findings, selected),
 			roundNum:         gate.round,
 			autoFixAttempts:  gate.autoFixes,
 			executionMS:      duration,
@@ -692,6 +694,20 @@ func recoveredLogPath(step *db.StepResult) string {
 	return ""
 }
 
+func (e *Executor) autoFixLimit(stepName types.StepName) int {
+	if e.config == nil {
+		return 0
+	}
+	return e.config.AutoFixLimit(stepName)
+}
+
+func (e *Executor) maxRoundsLimit(stepName types.StepName) int {
+	if e.config == nil {
+		return 0
+	}
+	return e.config.MaxRoundsLimit(stepName)
+}
+
 // executeStep runs a single step with approval coordination.
 // Returns whether to skip the remainder, an optional earlier restart step,
 // and any execution error.
@@ -699,18 +715,15 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	stepName := step.Name()
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
-	autoFixLimit := 0
-	maxRounds := 0
-	if e.config != nil {
-		autoFixLimit = e.config.AutoFixLimit(stepName)
-		maxRounds = e.config.MaxRoundsLimit(stepName)
-	}
+	autoFixLimit := e.autoFixLimit(stepName)
+	maxRounds := e.maxRoundsLimit(stepName)
 
-	// Mark step as running
-	if err := e.db.StartStepWithLimits(sr.ID, autoFixLimit, maxRounds); err != nil {
-		return false, "", fmt.Errorf("start step %s: %w", stepName, err)
+	if !state.fixing {
+		if err := e.db.StartStepWithLimits(sr.ID, autoFixLimit, maxRounds); err != nil {
+			return false, "", fmt.Errorf("start step %s: %w", stepName, err)
+		}
+		e.emitStepEvent(ipc.EventStepStarted, run, repo, stepName, string(types.StepStatusRunning))
 	}
-	e.emitStepEvent(ipc.EventStepStarted, run, repo, stepName, string(types.StepStatusRunning))
 
 	// Track execution-only time, excluding approval wait periods.
 	phaseStart := time.Now()
@@ -853,6 +866,18 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		ciReadyNoCI = declaredNoCI
 		e.emitCIReadinessEvent(run, repo, ready, declaredNoCI)
 	}
+	// A fix round is marked fixing before the step re-executes and only
+	// changes status when Execute returns. A step whose fix round ends with
+	// ordinary execution (the CI monitor after a published repair) reports
+	// that here, so the durable status and every subscriber see running
+	// again; step_started is the event the TUI already maps to running.
+	markRunning := func() error {
+		if err := e.db.UpdateStepStatus(sr.ID, types.StepStatusRunning); err != nil {
+			return fmt.Errorf("return step status to running: %w", err)
+		}
+		e.emitStepEvent(ipc.EventStepStarted, run, repo, stepName, string(types.StepStatusRunning))
+		return nil
+	}
 	sctx := &StepContext{
 		Ctx:              ctx,
 		Run:              run,
@@ -871,6 +896,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		EvidenceDir:      e.runEvidenceDir(run.ID),
 		Fixing:           state.fixing,
 		PreviousFindings: state.previousFindings,
+		DeferredFindings: state.deferredFindings,
 		Log:              writeLog,
 		LogChunk:         writeLogChunk,
 		LogFile: func(text string) {
@@ -878,6 +904,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			touchLogActivity(text, true)
 		},
 		CIReadinessChanged: ciReadinessChanged,
+		MarkRunning:        markRunning,
 		OnPRMerged:         e.onPRMerged,
 	}
 	if stepName == types.StepReview {
@@ -958,9 +985,6 @@ rounds:
 		var inserted *db.StepRound
 		var dbErr error
 		roundTrigger := nextTrigger
-		if stepName == types.StepCI && restartFrom != "" && !sctx.Fixing {
-			roundTrigger = "auto_fix"
-		}
 		if stepName == types.StepReview {
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
@@ -968,7 +992,7 @@ rounds:
 				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
 			}
 		} else {
-			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, roundDuration)
+			inserted, dbErr = e.db.InsertStepRoundWithRepair(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, outcome.RepairPublished, roundDuration)
 		}
 		if dbErr != nil {
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
@@ -996,8 +1020,8 @@ rounds:
 				executionMS += time.Since(phaseStart).Milliseconds()
 				fixCount := findingsCount(fixableFindings)
 				writeLog(fmt.Sprintf("auto-fix round %d/%d starting after round %d (%d %s)", autoFixAttempts, autoFixLimit, roundNum, fixCount, pluralize(fixCount, "finding", "findings")))
-				if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
-					slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
+				if dbErr := e.db.StartStepFixRound(sr.ID, autoFixLimit); dbErr != nil {
+					slog.Warn("failed to start step fix round in db", "step", stepName, "error", dbErr)
 				}
 				if currentRoundID != "" {
 					if idsJSON := findingIDsJSON(fixableFindings); idsJSON != "" {
@@ -1010,6 +1034,7 @@ rounds:
 				phaseStart = time.Now()
 				sctx.Fixing = true
 				sctx.PreviousFindings = fixableFindings
+				sctx.DeferredFindings = removeMatchingFindingsJSON(outcome.Findings, fixableFindings)
 				nextTrigger = "auto_fix"
 				continue
 			}
@@ -1146,13 +1171,14 @@ rounds:
 				phaseStart = time.Now()
 				selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs)
 				writeLog(fmt.Sprintf("user-fix round starting after round %d (%d %s selected)", roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
-				if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
-					slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
+				if dbErr := e.db.StartStepFixRound(sr.ID, autoFixLimit); dbErr != nil {
+					slog.Warn("failed to start step fix round in db", "step", stepName, "error", dbErr)
 				}
 				sctx.Fixing = true
 				selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
 				mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
 				sctx.PreviousFindings = mergedFindings
+				sctx.DeferredFindings = removeMatchingFindingsJSON(outcome.Findings, selectedFindings)
 				nextTrigger = "auto_fix"
 				if currentRoundID != "" {
 					allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)

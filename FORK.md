@@ -58,25 +58,41 @@ Touches: `internal/update/update.go`. Regressions: `internal/update/fork_test.go
 
 ## Local configuration this fork assumes
 
-Neither patch does anything until configured. The operator config that makes the round budget active lives in `~/.no-mistakes/config.yaml`:
+No patch does anything until configured. The operator config that makes the round budget active lives in `~/.no-mistakes/config.yaml`:
 
 ```yaml
 max_rounds:
-  review: 4
+  review: 3
   test: 3
 
-# No base model or effort is pinned: review keeps the harness default, because
-# it is the pass that actually catches bugs. Only these duties are narrowed.
+# auto_fix.review defaults to 0, which parks the review gate on the first
+# blocking finding and waits for an agent decision. Left at 0, max_rounds.review
+# only ever bounds rounds an agent asks for, so a run driven by a bare
+# `git push` sits parked instead of converging.
+auto_fix:
+  review: 3
+
+# The review loop is pinned through upstream's review_agents, not through this
+# fork's purposes patch: it selects the role outright rather than narrowing a
+# harness-wide profile, and it can move a role to a different harness.
+review_agents:
+  fixer:
+    agent: claude
+    effort: medium
+
+# purposes keeps every duty outside the review loop. review itself is left
+# alone: no base model or effort is pinned, because it is the pass that
+# actually catches bugs.
 agent_config:
   claude:
     purposes:
-      review-fix:
-        effort: medium
       housekeeping:
         effort: low
 ```
 
-The purpose choices come from the local telemetry, not from taste: `review-fix` is 32.5% of all tokens and `housekeeping` 12.8%, and neither judges the change - one applies findings a review round already prescribed, the other edits documentation. `review` itself is left alone. Read your own split with `no-mistakes stats` before copying these.
+The duty choices come from the local telemetry, not from taste: the review fixer is 32.5% of all tokens and `housekeeping` 12.8%, and neither judges the change - one applies findings a review round already prescribed, the other edits documentation. Read your own split with `no-mistakes stats` before copying these.
+
+Every value here is per host. `max_rounds` and `auto_fix` in particular were set independently on this machine and on the Coder workspace.
 
 ## Building and installing over the released binary
 
@@ -165,6 +181,10 @@ Two things made this more than a config change:
 Config surface is documented in `docs/src/content/docs/reference/global-config.md` (`agent_config` -> `purposes`); the vocabulary lives in `internal/types/purpose.go`.
 
 Touches: `internal/types/purpose.go`, `internal/agent/purpose.go`, `internal/agentcfg/agentcfg.go`, `internal/config/config.go`, `internal/daemon/manager.go`, `internal/pipeline/instrument.go`.
+
+Since v1.72.0 upstream ships `review_agents`, which pins the `reviewer` and `fixer` roles to an explicit harness plus model and effort. It is the better tool for the review loop - it selects the role outright instead of narrowing a harness-wide profile, and it is the only one of the two that can move a role to a different harness - so this fork configures the review loop there and leaves `purposes` to govern every other duty. The two compose rather than compete: `Config.ForReviewAgent` writes the role's profile as a base with no purpose deltas, so the more specific setting wins and a `review`/`review-fix` delta can never re-narrow a role the operator pinned explicitly.
+
+`purposes` is kept because `review_agents` has exactly two roles. `housekeeping` - 12.8% of measured spend here - has no role to be pinned to, and neither does any other non-review duty.
 
 ## Deliberately not done
 

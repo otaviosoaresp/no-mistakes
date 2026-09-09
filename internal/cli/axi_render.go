@@ -48,12 +48,13 @@ type sharedWorkRow struct {
 }
 
 type activeStepRow struct {
-	Step         string `toon:"step"`
-	Status       string `toon:"status"`
-	ActiveFor    string `toon:"active_for"`
-	LastActivity string `toon:"last_activity"`
-	AgentPID     string `toon:"agent_pid"`
-	Round        string `toon:"round"`
+	Step           string `toon:"step"`
+	Status         string `toon:"status"`
+	ActiveFor      string `toon:"active_for"`
+	RoundActiveFor string `toon:"round_active_for"`
+	LastActivity   string `toon:"last_activity"`
+	AgentPID       string `toon:"agent_pid"`
+	Round          string `toon:"round"`
 }
 
 type findingRow struct {
@@ -96,6 +97,7 @@ type stepView struct {
 	FindingsJSON     string
 	FixSummaries     []string
 	StartedAt        *int64
+	RoundStartedAt   *int64
 	LastActivityAt   *int64
 	LastActivity     string
 	AgentPID         *int
@@ -150,6 +152,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			Status:           string(s.Status),
 			FixSummaries:     s.FixSummaries,
 			StartedAt:        s.StartedAt,
+			RoundStartedAt:   s.RoundStartedAt,
 			LastActivityAt:   s.LastActivityAt,
 			AgentPID:         s.AgentPID,
 			RoundCount:       s.RoundCount,
@@ -191,6 +194,7 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 			Name:           string(s.StepName),
 			Status:         string(s.Status),
 			StartedAt:      s.StartedAt,
+			RoundStartedAt: s.RoundStartedAt,
 			LastActivityAt: s.LastActivityAt,
 			AgentPID:       s.AgentPID,
 		}
@@ -321,16 +325,15 @@ func (rv runView) findingsTally() string {
 	return joinComma(parts)
 }
 
-// fixRows flattens the fixes the pipeline applied across all steps into
-// renderable rows, in step then round order. A fix round that recorded no
-// summary still produced a fix commit, so it gets an explicit placeholder
-// rather than being dropped.
+// fixRows flattens fix-attempt summaries in step then round order. Dispatching
+// a fix round does not prove a change was applied; legacy empty summaries
+// must not manufacture that claim.
 func (rv runView) fixRows() []fixRow {
 	var rows []fixRow
 	for _, s := range rv.Steps {
 		for _, summary := range s.FixSummaries {
 			if summary == "" {
-				summary = "fix applied (no summary recorded)"
+				summary = "fix attempted (no result recorded)"
 			}
 			rows = append(rows, fixRow{Step: s.Name, Summary: summary})
 		}
@@ -345,12 +348,13 @@ func (rv runView) activeRows() []activeStepRow {
 			continue
 		}
 		rows = append(rows, activeStepRow{
-			Step:         s.Name,
-			Status:       s.Status,
-			ActiveFor:    s.activeFor(),
-			LastActivity: s.lastActivitySummary(),
-			AgentPID:     s.agentPIDString(),
-			Round:        s.roundSummary(),
+			Step:           s.Name,
+			Status:         s.Status,
+			ActiveFor:      s.activeFor(),
+			RoundActiveFor: s.roundActiveFor(),
+			LastActivity:   s.lastActivitySummary(),
+			AgentPID:       s.agentPIDString(),
+			Round:          s.roundSummary(),
 		})
 	}
 	return rows
@@ -361,6 +365,13 @@ func (s stepView) activeFor() string {
 		return ""
 	}
 	return formatDurationSince(*s.StartedAt)
+}
+
+func (s stepView) roundActiveFor() string {
+	if s.RoundStartedAt == nil {
+		return ""
+	}
+	return formatDurationSince(*s.RoundStartedAt)
 }
 
 func (s stepView) lastActivitySummary() string {
