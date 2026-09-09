@@ -56,6 +56,22 @@ Updating is the build-and-install procedure below. The field is left `false` in 
 
 Touches: `internal/update/update.go`. Regressions: `internal/update/fork_test.go`.
 
+### The version says `+fork`
+
+`git describe` on a fork checkout produces a string indistinguishable from an ordinary upstream development build cut from the same tag, and the installed CLI and the daemon are the same binary - so "is the thing running right now our build?" has to be answerable from the version alone.
+
+`buildinfo.CurrentVersion` appends `+fork`:
+
+```
+no-mistakes version v1.73.0-16-g94638f5+fork (94638f5) 2026-09-09T21:38:43Z
+```
+
+It is applied in `buildinfo` rather than in the `Makefile` so it survives every way this tree is built - `make build`, a bare `go build`, and the cross-compile recipe below. It is semver build metadata (everything from `+` on), which parsing and comparison discard, so it changes no version decision anywhere; it only rides the surfaces that report the version: `--version`, `doctor`, the run record's `no_mistakes_version`, the eval capture manifest, and telemetry. A `dev` build stays bare, because `telemetry.buildChannel` treats any other value as a release channel and that decides whether an unconfigured build emits remote telemetry at all.
+
+After installing, `no-mistakes --version` not showing `+fork` means the released binary is back in place.
+
+Touches: `internal/buildinfo/version.go`. Regressions: `internal/buildinfo/version_test.go`.
+
 ## Local configuration this fork assumes
 
 No patch does anything until configured. The operator config that makes the round budget active lives in `~/.no-mistakes/config.yaml`:
